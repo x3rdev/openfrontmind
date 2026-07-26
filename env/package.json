@@ -4,10 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "harness": "tsx src/harness.ts"
+    "build": "node build.mjs",
+    "harness": "node build.mjs && node dist/harness.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
+    "esbuild": "^0.28.1",
     "tsx": "^4.23.1",
     "typescript": "^7.0.2"
   }

@@ -6,6 +6,7 @@ __pycache__/
 
 # Node
 node_modules/
+env/dist/
 
 # OS
 .DS_Store
@@ -13,3 +14,4 @@ node_modules/
 # IDE
 .idea/
 
+/engine/
