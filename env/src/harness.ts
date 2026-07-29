@@ -64,7 +64,7 @@ export async function reset(
     gameMapSize: GameMapSize.Normal,
     gameMode: GameMode.FFA,
     gameType: GameType.Public,
-    difficulty: Difficulty.Medium,
+    difficulty: Difficulty.Impossible,
     nations: 5,
     donateGold: false,
     donateTroops: false,
@@ -120,6 +120,10 @@ export async function reset(
     turnNumber: 0,
     fatalError: undefined,
 };
+  // Every tile update seen during the spawn-phase loop below gets collected
+  // here so reset()'s caller gets the full territory picture established by
+  // spawning, not just the diff from the single last tick.
+  const spawnTileUpdates: Uint32Array[] = [];
   const runner = new GameRunner(
     game,
     new Executor(game, gameStart.gameID, undefined),
@@ -130,6 +134,7 @@ export async function reset(
       }
       state.packedTileUpdates = gu.packedTileUpdates
       state.packedPlayerUpdates = gu.packedPlayerUpdates
+      spawnTileUpdates.push(gu.packedTileUpdates);
     },
   );
   runner.init();
@@ -146,6 +151,15 @@ export async function reset(
       throw new Error(`game errored during spawn phase:\n${state.fatalError}`);
     }
   }
+
+  const totalLength = spawnTileUpdates.reduce((sum, arr) => sum + arr.length, 0);
+  const combined = new Uint32Array(totalLength);
+  let offset = 0;
+  for (const arr of spawnTileUpdates) {
+    combined.set(arr, offset);
+    offset += arr.length;
+  }
+  state.packedTileUpdates = combined;
 
   return { runner, game, state, agentClientID };
 }

@@ -34,14 +34,19 @@ let session: HarnessSession | undefined;
 
 async function handle(cmd: Record<string, unknown>): Promise<void> {
   if (cmd.cmd === "reset") {
-    const mapArg = typeof cmd.map === "string" ? cmd.map : "World";
-    const map = GameMapType[mapArg as keyof typeof GameMapType];
-    if (map === undefined) {
-      send({ ok: false, error: `unknown map "${mapArg}"` });
-      return;
+    // Only parse/validate what the client actually sent - anything absent
+    // stays undefined so harness.ts's reset() applies its own defaults,
+    // rather than duplicating (and silently overriding) them here.
+    let map: GameMapType | undefined;
+    if (typeof cmd.map === "string") {
+      map = GameMapType[cmd.map as keyof typeof GameMapType];
+      if (map === undefined) {
+        send({ ok: false, error: `unknown map "${cmd.map}"` });
+        return;
+      }
     }
-    const seed = typeof cmd.seed === "string" ? cmd.seed : "seedseed";
-    const bots = typeof cmd.bots === "number" ? cmd.bots : 50;
+    const seed = typeof cmd.seed === "string" ? cmd.seed : undefined;
+    const bots = typeof cmd.bots === "number" ? cmd.bots : undefined;
 
     session = await reset(seed, map, bots);
     send({
@@ -51,6 +56,10 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       playersAlive: session.game.players().filter((p) => p.isAlive()).length,
       done: false,
       winner: null,
+      width: session.game.map().width(),
+      height: session.game.map().height(),
+      packedTileUpdates: toBase64(session.state.packedTileUpdates),
+      packedPlayerUpdates: toBase64(session.state.packedPlayerUpdates),
     });
     return;
   }
