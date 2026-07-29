@@ -13,11 +13,12 @@
 import esbuild from "esbuild";
 
 await esbuild.build({
-  entryPoints: ["src/harness.ts"],
+  entryPoints: ["src/cli.ts", "src/server.ts"],
   bundle: true,
   platform: "node",
   format: "esm",
   target: "es2020",
   tsconfig: "../engine/OpenFrontIO/tsconfig.json",
-  outfile: "dist/harness.mjs",
+  outdir: "dist",
+  outExtension: { ".js": ".mjs" },
 });

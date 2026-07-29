@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "harness": "node build.mjs && node dist/harness.mjs"
+    "harness": "node build.mjs && node dist/cli.mjs",
+    "server": "node build.mjs && node dist/server.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

@@ -8,12 +8,21 @@
 // initial observation/state.
 
 import path from "path";
-import { fileURLToPath } from "url";
-import { parseArgs } from "node:util";
+import {fileURLToPath} from "url";
 import {NodeGameMapLoader} from "../../engine/OpenFrontIO/tests/perf/fullgame/NodeGameMapLoader";
 import {Config} from "../../engine/OpenFrontIO/src/core/configuration/Config";
 import {GameConfig, GameStartInfo, StampedIntent} from "../../engine/OpenFrontIO/src/core/Schemas";
-import {Difficulty, GameMapSize, GameMapType, GameMode, GameType, Player, Team} from "../../engine/OpenFrontIO/src/core/game/Game";
+import {
+  Difficulty,
+  GameMapSize,
+  GameMapType,
+  GameMode,
+  GameType,
+  Player,
+  PlayerInfo,
+  PlayerType,
+  Team
+} from "../../engine/OpenFrontIO/src/core/game/Game";
 import {loadTerrainMap} from "../../engine/OpenFrontIO/src/core/game/TerrainMapLoader";
 import {PseudoRandom} from "../../engine/OpenFrontIO/src/core/PseudoRandom";
 import {simpleHash} from "../../engine/OpenFrontIO/src/core/Util";
@@ -21,7 +30,7 @@ import {createNationsForGame} from "../../engine/OpenFrontIO/src/core/game/Natio
 import {createGame} from "../../engine/OpenFrontIO/src/core/game/GameImpl";
 import {Executor} from "../../engine/OpenFrontIO/src/core/execution/ExecutionManager";
 import {GameRunner} from "../../engine/OpenFrontIO/src/core/GameRunner";
-import {GameUpdateType, HashUpdate} from "../../engine/OpenFrontIO/src/core/game/GameUpdates";
+import {run} from "node:test";
 
 
 const PROJECT_ROOT = path.resolve(
@@ -33,14 +42,16 @@ const MAX_SPAWN_TURNS = 1000;
 
 export interface HarnessState {
   turnNumber: number;
-  lastHash: HashUpdate | undefined;
   fatalError: string | undefined;
+  packedTileUpdates?: Uint32Array;
+  packedPlayerUpdates?: Float64Array;
 }
 
 export interface HarnessSession {
   runner: GameRunner;
   game: ReturnType<typeof createGame>;
   state: HarnessState;
+  agentClientID: string;
 }
 
 export async function reset(
@@ -64,13 +75,13 @@ export async function reset(
     randomSpawn: true, // adjust later
     waterNukes: false,
   };
+
   const gameStart: GameStartInfo = {
     gameID: seed,
     lobbyCreatedAt: 0,
     config: gameConfig,
-    players: [],
+    players: []
   };
-
 
   const config = new Config(gameConfig, null, false);
   const mapLoader = new NodeGameMapLoader(PROJECT_ROOT);
@@ -80,6 +91,15 @@ export async function reset(
       mapLoader,
   );
   const random = new PseudoRandom(simpleHash(gameStart.gameID));
+
+  const agentClientID = "agent001";
+  const agentPlayer = new PlayerInfo(
+      "openfrontmind",
+      PlayerType.Human,
+      agentClientID,
+      random.nextID()
+  );
+
   const nations = createNationsForGame(
     gameStart,
     terrain.nations,
@@ -88,7 +108,7 @@ export async function reset(
     random,
   );
   const game = createGame(
-    [],
+    [agentPlayer],
     nations,
     terrain.gameMap,
     terrain.miniGameMap,
@@ -98,9 +118,8 @@ export async function reset(
 
   const state: HarnessState = {
     turnNumber: 0,
-    lastHash: undefined,
     fatalError: undefined,
-  };
+};
   const runner = new GameRunner(
     game,
     new Executor(game, gameStart.gameID, undefined),
@@ -109,10 +128,8 @@ export async function reset(
         state.fatalError = `${gu.errMsg}\n${gu.stack ?? ""}`;
         return;
       }
-      const hashes = gu.updates[GameUpdateType.Hash] as HashUpdate[];
-      if (hashes.length > 0) {
-        state.lastHash = hashes[hashes.length - 1];
-      }
+      state.packedTileUpdates = gu.packedTileUpdates
+      state.packedPlayerUpdates = gu.packedPlayerUpdates
     },
   );
   runner.init();
@@ -130,15 +147,16 @@ export async function reset(
     }
   }
 
-  return { runner, game, state };
+  return { runner, game, state, agentClientID };
 }
 
 export interface StepResult {
   tick: number;
   playersAlive: number;
-  lastHash: HashUpdate | undefined;
   done: boolean;
   winner: Player | Team | null;
+  packedTileUpdates?: Uint32Array;
+  packedPlayerUpdates?: Float64Array;
 }
 
 export function step(
@@ -151,86 +169,13 @@ export function step(
   if (!ok || state.fatalError !== undefined) {
     throw new Error(`game errored during step:\n${state.fatalError}`);
   }
-
   const winner = game.getWinner();
   return {
     tick: game.ticks(),
     playersAlive: game.players().filter((p) => p.isAlive()).length,
-    lastHash: state.lastHash,
     done: winner !== null,
     winner,
+    packedTileUpdates: state.packedTileUpdates,
+    packedPlayerUpdates: state.packedPlayerUpdates
   };
 }
-
-
-interface RunResult {
-  ticksRun: number;
-  elapsedMs: number;
-  finalHash: number | undefined;
-}
-
-async function runGame(
-  seed: string,
-  map: GameMapType,
-  bots: number,
-  ticks: number,
-): Promise<RunResult> {
-  const session = await reset(seed, map, bots);
-  const start = performance.now();
-  let ticksRun = 0;
-  for (; ticksRun < ticks; ticksRun++) {
-    const result = step(session, []);
-    if (result.done) break;
-  }
-  const elapsedMs = performance.now() - start;
-  return { ticksRun, elapsedMs, finalHash: session.state.lastHash?.hash };
-}
-
-function logRun(label: string, run: RunResult): void {
-  const ticksPerSec = run.ticksRun / (run.elapsedMs / 1000);
-  console.log(
-    `${label}: ${run.ticksRun} ticks in ${run.elapsedMs.toFixed(0)}ms ` +
-      `(${ticksPerSec.toFixed(1)} ticks/sec), hash=${run.finalHash}`,
-  );
-}
-
-async function main() {
-  const { values } = parseArgs({
-    options: {
-      map: { type: "string", default: "World" },
-      ticks: { type: "string", default: "200" },
-      seed: { type: "string", default: "seedseed" },
-      bots: { type: "string", default: "50" },
-    },
-  });
-
-  const map = GameMapType[values.map as keyof typeof GameMapType];
-  if (map === undefined) {
-    throw new Error(`unknown --map "${values.map}"`);
-  }
-  const ticks = Number(values.ticks);
-  const bots = Number(values.bots);
-  const seed = values.seed as string;
-
-  console.log(`map=${map} bots=${bots} seed=${seed} ticks=${ticks}`);
-
-  // Run the identical seed twice — this is the vendoring regression check,
-  // not a perf sanity check: matching hashes prove the engine is producing
-  // the same simulation state both times, i.e. it's actually deterministic.
-  const run1 = await runGame(seed, map, bots, ticks);
-  logRun("run 1", run1);
-  const run2 = await runGame(seed, map, bots, ticks);
-  logRun("run 2", run2);
-
-  if (run1.finalHash !== undefined && run1.finalHash === run2.finalHash) {
-    console.log(`PASS: identical hash across repeated runs (seed=${seed})`);
-  } else {
-    console.error(
-      `FAIL: hash mismatch across repeated runs (seed=${seed}): ` +
-        `${run1.finalHash} vs ${run2.finalHash}`,
-    );
-    process.exitCode = 1;
-  }
-}
-
-main();
