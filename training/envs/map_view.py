@@ -20,15 +20,23 @@ GameMap.ts (GameMapImpl's PLAYER_ID_MASK/IS_LAND_BIT etc):
 
 import cv2
 import numpy as np
-from matplotlib import colormaps
 
-from bridge import OpenFrontBridge
+from raster import MaskedRaster
 
 PLAYER_ID_MASK = 0xFFF
 IS_LAND_BIT = 23  # terrainByte's IS_LAND_BIT (7) shifted by 16
 
+WATER = (0.55, 0.75, 0.95)
+UNOWNED_LAND = (0.85, 0.83, 0.75)
+AGENT_COLOR = (1.0, 0.05, 0.05)  # bright red - not part of tab20, stands out
 
-def apply_tile_updates(owner_grid, land_mask, width, tile_updates):
+
+def apply_tile_updates(
+    owner_grid: np.ndarray,
+    land_mask: np.ndarray,
+    width: int,
+    tile_updates: np.ndarray | None,
+) -> None:
     if tile_updates is None or len(tile_updates) == 0:
         return
     refs = tile_updates[0::2]
@@ -39,52 +47,73 @@ def apply_tile_updates(owner_grid, land_mask, width, tile_updates):
     land_mask[ys, xs] = (states >> IS_LAND_BIT) & 1 == 1
 
 
-def render(owner_grid, land_mask):
+def render(
+    owner_grid: np.ndarray,
+    land_mask: np.ndarray,
+    agent_small_id: int | None = None,
+) -> MaskedRaster:
     h, w = owner_grid.shape
-    img = np.empty((h, w, 3))
-    img[:] = (0.55, 0.75, 0.95)  # water
-    img[land_mask & (owner_grid == 0)] = (0.85, 0.83, 0.75)  # unowned land
-
     owned = land_mask & (owner_grid != 0)
-    cmap = colormaps["tab20"]
-    img[owned] = cmap((owner_grid[owned].astype(float) % 20) / 20)[:, :3]
+    canvas = (
+        MaskedRaster(h, w, background=WATER)
+        .fill(land_mask & (owner_grid == 0), UNOWNED_LAND)
+        .fill_by_colormap(owned, owner_grid)
+    )
+    if agent_small_id is not None:
+        canvas.fill(owner_grid == agent_small_id, AGENT_COLOR)
+    return canvas
+
+
+def outline_agent_territory(
+    img: np.ndarray,
+    owner_grid: np.ndarray,
+    agent_small_id: int | None,
+    scale: int = 1,
+    color: tuple[int, int, int] = (0, 255, 255),  # bright yellow, BGR
+    thickness: int = 2,
+) -> np.ndarray:
+    if agent_small_id is None:
+        return img
+    mask = (owner_grid == agent_small_id).astype(np.uint8) * 255
+    if scale != 1:
+        mask = cv2.resize(mask, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(img, contours, -1, color, thickness)
     return img
 
 
-def to_bgr_uint8(img):
-    # cv2 expects BGR channel order and uint8 0-255, not RGB float 0-1.
-    return cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+def apply_unit_updates(units: dict, unit_updates: list | None) -> None:
+    if not unit_updates:
+        return
+    for u in unit_updates:
+        if not u["isActive"] or u["markedForDeletion"] is not False:
+            units.pop(u["id"], None)
+        else:
+            units[u["id"]] = u
 
 
-def main(ticks=2000, redraw_every=10, seed="seedseed"):
-    with OpenFrontBridge() as bridge:
-        result = bridge.reset(seed=seed)
-        width, height = result["width"], result["height"]
-        owner_grid = np.zeros((height, width), dtype=np.uint32)
-        land_mask = np.zeros((height, width), dtype=bool)
-        apply_tile_updates(owner_grid, land_mask, width, result["packedTileUpdates"])
-
-        cv2.imshow("map", to_bgr_uint8(render(owner_grid, land_mask)))
-        cv2.waitKey(1)
-
-        try:
-            for i in range(ticks):
-                result = bridge.step([])
-                apply_tile_updates(owner_grid, land_mask, width, result["packedTileUpdates"])
-                if i % redraw_every == 0:
-                    cv2.imshow("map", to_bgr_uint8(render(owner_grid, land_mask)))
-                    # waitKey also pumps the window's event loop - required for
-                    # it to actually repaint, not just a "wait for keypress".
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
-                if result["done"]:
-                    print("game over, winner:", result["winner"])
-                    break
-        finally:
-            cv2.imshow("map", to_bgr_uint8(render(owner_grid, land_mask)))
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
+UNIT_LABELS = {
+    "City": "C",
+    "Factory": "F",
+    "Port": "P",
+    "Missile Silo": "MS",
+    "Defense Post": "D",
+    "SAM Launcher": "S",
+    "Train": "T",
+}
 
 
-if __name__ == "__main__":
-    main(ticks=int(10e100), seed="brad has a big booty")
+def draw_units(img: np.ndarray, units: dict, width: int, scale: int = 1) -> np.ndarray:
+    # Fixed black-on-white marker, not owner-colored - an owner-colored marker
+    # can blend into same-colored territory underneath it and disappear.
+    radius = max(4, scale)
+    for u in units.values():
+        x, y = (u["pos"] % width) * scale, (u["pos"] // width) * scale
+        cv2.circle(img, (x, y), radius, (255, 255, 255), -1)
+        cv2.circle(img, (x, y), radius, (0, 0, 0), 2)
+        label = UNIT_LABELS.get(u["unitType"], "?")
+        cv2.putText(
+            img, label, (x - radius, y - radius - 4),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA,
+        )
+    return img
