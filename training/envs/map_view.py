@@ -1,50 +1,13 @@
-"""Quick visual check that game state is being tracked correctly.
-
-Renders tile ownership as it comes in over the bridge - land tiles colored
-by owner, water tiles a fixed color, unowned land another fixed color.
-
-Bit layout below is taken directly from the packing logic in
-engine/OpenFrontIO/src/core/game/GameImpl.ts (recordTileUpdate) and
-GameMap.ts (GameMapImpl's PLAYER_ID_MASK/IS_LAND_BIT etc):
-
-  packed = (tileState & 0xffff) | (terrainByte << 16)
-
-  tileState (low 16 bits):
-    bits 0-11  owner smallID (0 = unowned)
-    bit 13     fallout
-    bit 14     defense bonus
-
-  terrainByte (bits 16-23 of packed, so absolute bit 16+N):
-    bit 23 (terrainByte bit 7)  is land
-"""
+"""Renders accumulated game state (game_state.py) for a quick visual check."""
 
 import cv2
 import numpy as np
 
 from raster import MaskedRaster
 
-PLAYER_ID_MASK = 0xFFF
-IS_LAND_BIT = 23  # terrainByte's IS_LAND_BIT (7) shifted by 16
-
 WATER = (0.55, 0.75, 0.95)
 UNOWNED_LAND = (0.85, 0.83, 0.75)
 AGENT_COLOR = (1.0, 0.05, 0.05)  # bright red - not part of tab20, stands out
-
-
-def apply_tile_updates(
-    owner_grid: np.ndarray,
-    land_mask: np.ndarray,
-    width: int,
-    tile_updates: np.ndarray | None,
-) -> None:
-    if tile_updates is None or len(tile_updates) == 0:
-        return
-    refs = tile_updates[0::2]
-    states = tile_updates[1::2]
-    xs = refs % width
-    ys = refs // width
-    owner_grid[ys, xs] = states & PLAYER_ID_MASK
-    land_mask[ys, xs] = (states >> IS_LAND_BIT) & 1 == 1
 
 
 def render(
@@ -80,16 +43,6 @@ def outline_agent_territory(
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(img, contours, -1, color, thickness)
     return img
-
-
-def apply_unit_updates(units: dict, unit_updates: list | None) -> None:
-    if not unit_updates:
-        return
-    for u in unit_updates:
-        if not u["isActive"] or u["markedForDeletion"] is not False:
-            units.pop(u["id"], None)
-        else:
-            units[u["id"]] = u
 
 
 UNIT_LABELS = {

@@ -4,7 +4,8 @@ import time
 import numpy as np
 
 from bridge import OpenFrontBridge
-from map_view import apply_tile_updates, apply_unit_updates, draw_units, outline_agent_territory, render
+from game_state import apply_tile_updates, apply_unit_updates
+from map_view import draw_units, outline_agent_territory, render
 
 
 def main(visualize: bool, seed: str, scale: int) -> None:
