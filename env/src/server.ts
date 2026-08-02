@@ -8,7 +8,7 @@
 console.log = console.error;
 
 import readline from "node:readline";
-import { GameMapType, Player, Team } from "../../engine/OpenFrontIO/src/core/game/Game";
+import { Player, Team } from "../../engine/OpenFrontIO/src/core/game/Game";
 import { StampedIntent } from "../../engine/OpenFrontIO/src/core/Schemas";
 import { HarnessSession, reset, step } from "./harness";
 
@@ -36,22 +36,24 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
   if (cmd.cmd === "reset") {
     // Only parse/validate what the client actually sent - anything absent
     // stays undefined so harness.ts's reset() applies its own defaults,
-    // rather than duplicating (and silently overriding) them here.
-    let map: GameMapType | undefined;
-    if (typeof cmd.map === "string") {
-      map = GameMapType[cmd.map as keyof typeof GameMapType];
-      if (map === undefined) {
-        send({ ok: false, error: `unknown map "${cmd.map}"` });
-        return;
-      }
-    }
+    // rather than duplicating (and silently overriding) them here. An
+    // unrecognized map name surfaces as an ENOENT from loadTestMap, caught
+    // by the try/catch around handle() below.
+    const map = typeof cmd.map === "string" ? cmd.map : undefined;
     const seed = typeof cmd.seed === "string" ? cmd.seed : undefined;
     const bots = typeof cmd.bots === "number" ? cmd.bots : undefined;
+    const nations =
+      typeof cmd.nations === "number" || cmd.nations === "default" || cmd.nations === "disabled"
+        ? cmd.nations
+        : undefined;
 
-    session = await reset(seed, map, bots);
+    session = await reset(seed, map, bots, nations);
+    const agent = session.game.playerByClientID(session.agentClientID);
     send({
-      ok: true,
+      cmd_success: true,
       agentClientID: session.agentClientID,
+      agentSmallID: agent === null ? null : agent.smallID(),
+      agentName: agent === null ? null : agent.name(),
       tick: session.game.ticks(),
       playersAlive: session.game.players().filter((p) => p.isAlive()).length,
       done: false,
@@ -60,13 +62,14 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       height: session.game.map().height(),
       packedTileUpdates: toBase64(session.state.packedTileUpdates),
       packedPlayerUpdates: toBase64(session.state.packedPlayerUpdates),
+      unitUpdates: session.state.unitUpdates,
     });
     return;
   }
 
   if (cmd.cmd === "step") {
     if (session === undefined) {
-      send({ ok: false, error: "step called before reset" });
+      send({ cmd_success: false, error: "step called before reset" });
       return;
     }
     const intents = Array.isArray(cmd.intents)
@@ -74,18 +77,20 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       : [];
     const result = step(session, intents);
     send({
-      ok: true,
+      cmd_success: true,
       tick: result.tick,
       playersAlive: result.playersAlive,
       done: result.done,
       winner: winnerToJSON(result.winner),
       packedTileUpdates: toBase64(result.packedTileUpdates),
       packedPlayerUpdates: toBase64(result.packedPlayerUpdates),
+      attackMask: result.attackMask,
+      unitUpdates: result.unitUpdates,
     });
     return;
   }
 
-  send({ ok: false, error: `unknown cmd "${String(cmd.cmd)}"` });
+  send({ cmd_success: false, error: `unknown cmd "${String(cmd.cmd)}"` });
 }
 
 // Commands must be handled strictly one-at-a-time, in arrival order — reset()
@@ -101,13 +106,13 @@ rl.on("line", (line) => {
     try {
       cmd = JSON.parse(line);
     } catch (e) {
-      send({ ok: false, error: `invalid JSON: ${(e as Error).message}` });
+      send({ cmd_success: false, error: `invalid JSON: ${(e as Error).message}` });
       return;
     }
     try {
       await handle(cmd);
     } catch (e) {
-      send({ ok: false, error: (e as Error).message });
+      send({ cmd_success: false, error: (e as Error).message });
     }
   });
 });

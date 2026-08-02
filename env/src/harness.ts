@@ -2,14 +2,9 @@
 // No subprocess, no bridge protocol yet — just validating the API shape
 // and measuring raw ticks/sec by driving engine/'s GameRunner directly.
 
-// TODO: reset(seed, map, bots) — build Config, load the map via
-// NodeGameMapLoader, create nations/bots, create the game, wire up
-// GameRunner + Executor, drive through the spawn phase, return the
-// initial observation/state.
-
+import fs from "fs";
 import path from "path";
 import {fileURLToPath} from "url";
-import {NodeGameMapLoader} from "../../engine/OpenFrontIO/tests/perf/fullgame/NodeGameMapLoader";
 import {Config} from "../../engine/OpenFrontIO/src/core/configuration/Config";
 import {GameConfig, GameStartInfo, StampedIntent} from "../../engine/OpenFrontIO/src/core/Schemas";
 import {
@@ -19,11 +14,13 @@ import {
   GameMode,
   GameType,
   Player,
+  PlayerID,
   PlayerInfo,
   PlayerType,
   Team
 } from "../../engine/OpenFrontIO/src/core/game/Game";
-import {loadTerrainMap} from "../../engine/OpenFrontIO/src/core/game/TerrainMapLoader";
+import {genTerrainFromBin, MapManifest} from "../../engine/OpenFrontIO/src/core/game/TerrainMapLoader";
+import {GameUpdateType, UnitUpdate} from "../../engine/OpenFrontIO/src/core/game/GameUpdates";
 import {PseudoRandom} from "../../engine/OpenFrontIO/src/core/PseudoRandom";
 import {simpleHash} from "../../engine/OpenFrontIO/src/core/Util";
 import {createNationsForGame} from "../../engine/OpenFrontIO/src/core/game/NationCreation";
@@ -40,11 +37,42 @@ const PROJECT_ROOT = path.resolve(
 
 const MAX_SPAWN_TURNS = 1000;
 
+// Loads any vendored testdata map by folder name (e.g. "world", "plains") -
+// every folder under tests/testdata/maps/ has the same map.bin/map4x.bin/
+// manifest.json layout, so one path handles all of them uniformly instead of
+// going through GameMapType/NodeGameMapLoader, which only resolves maps that
+// happen to have a GameMapType enum entry. Mirrors tests/util/Setup.ts.
+// nations/additionalNations default to [] for manifests that don't define
+// them (the synthetic maps); gameConfig.nations being a fixed number means
+// the game generates procedural nations regardless, so this is safe.
+async function loadTestMap(name: string) {
+  const dir = path.join(PROJECT_ROOT, name);
+  const manifest: MapManifest = JSON.parse(
+    fs.readFileSync(path.join(dir, "manifest.json"), "utf8"),
+  );
+  const gameMap = await genTerrainFromBin(
+    manifest.map,
+    new Uint8Array(fs.readFileSync(path.join(dir, "map.bin"))),
+  );
+  const miniGameMap = await genTerrainFromBin(
+    manifest.map4x,
+    new Uint8Array(fs.readFileSync(path.join(dir, "map4x.bin"))),
+  );
+  return {
+    gameMap,
+    miniGameMap,
+    nations: manifest.nations ?? [],
+    additionalNations: manifest.additionalNations ?? [],
+    teamGameSpawnAreas: manifest.teamGameSpawnAreas,
+  };
+}
+
 export interface HarnessState {
   turnNumber: number;
   fatalError: string | undefined;
   packedTileUpdates?: Uint32Array;
   packedPlayerUpdates?: Float64Array;
+  unitUpdates?: UnitUpdate[];
 }
 
 export interface HarnessSession {
@@ -56,16 +84,21 @@ export interface HarnessSession {
 
 export async function reset(
   seed: string = "seedseed",
-  map: GameMapType = GameMapType.World,
+  map: string = "big_plains",
   bots: number = 50,
+  nations: number | "default" | "disabled" = 5,
 ): Promise<HarnessSession> {
   const gameConfig: GameConfig = {
-    gameMap: map,
+    // Cosmetic only - GameConfig.gameMap wants a GameMapType, but real
+    // terrain always comes from loadTestMap(map) below regardless of what's
+    // set here (most vendored testdata maps, e.g. "plains", have no
+    // GameMapType entry at all).
+    gameMap: GameMapType.World,
     gameMapSize: GameMapSize.Normal,
     gameMode: GameMode.FFA,
     gameType: GameType.Public,
-    difficulty: Difficulty.Impossible,
-    nations: 5,
+    difficulty: Difficulty.Easy,
+    nations,
     donateGold: false,
     donateTroops: false,
     bots,
@@ -84,12 +117,7 @@ export async function reset(
   };
 
   const config = new Config(gameConfig, null, false);
-  const mapLoader = new NodeGameMapLoader(PROJECT_ROOT);
-  const terrain = await loadTerrainMap(
-      gameConfig.gameMap,
-      gameConfig.gameMapSize,
-      mapLoader,
-  );
+  const terrain = await loadTestMap(map);
   const random = new PseudoRandom(simpleHash(gameStart.gameID));
 
   const agentClientID = "agent001";
@@ -100,7 +128,7 @@ export async function reset(
       random.nextID()
   );
 
-  const nations = createNationsForGame(
+  const createdNations = createNationsForGame(
     gameStart,
     terrain.nations,
     terrain.additionalNations,
@@ -109,7 +137,7 @@ export async function reset(
   );
   const game = createGame(
     [agentPlayer],
-    nations,
+    createdNations,
     terrain.gameMap,
     terrain.miniGameMap,
     config,
@@ -119,11 +147,12 @@ export async function reset(
   const state: HarnessState = {
     turnNumber: 0,
     fatalError: undefined,
-};
-  // Every tile update seen during the spawn-phase loop below gets collected
-  // here so reset()'s caller gets the full territory picture established by
+  };
+  // Every tile/unit update seen during the spawn-phase loop below gets
+  // collected here so reset()'s caller gets the full picture established by
   // spawning, not just the diff from the single last tick.
   const spawnTileUpdates: Uint32Array[] = [];
+  const spawnUnitUpdates: UnitUpdate[] = [];
   const runner = new GameRunner(
     game,
     new Executor(game, gameStart.gameID, undefined),
@@ -134,7 +163,9 @@ export async function reset(
       }
       state.packedTileUpdates = gu.packedTileUpdates
       state.packedPlayerUpdates = gu.packedPlayerUpdates
+      state.unitUpdates = gu.updates[GameUpdateType.Unit];
       spawnTileUpdates.push(gu.packedTileUpdates);
+      spawnUnitUpdates.push(...gu.updates[GameUpdateType.Unit]);
     },
   );
   runner.init();
@@ -160,8 +191,15 @@ export async function reset(
     offset += arr.length;
   }
   state.packedTileUpdates = combined;
+  state.unitUpdates = spawnUnitUpdates;
 
   return { runner, game, state, agentClientID };
+}
+
+export interface AttackTarget {
+  // null targetID means unclaimed land ("wilderness") rather than a player.
+  targetID: PlayerID | null;
+  smallID: number | null;
 }
 
 export interface StepResult {
@@ -171,6 +209,24 @@ export interface StepResult {
   winner: Player | Team | null;
   packedTileUpdates?: Uint32Array;
   packedPlayerUpdates?: Float64Array;
+  attackMask: AttackTarget[];
+  unitUpdates?: UnitUpdate[];
+}
+
+// nearby() is what the engine's own scripted AI uses too.
+function computeAttackMask(
+  game: ReturnType<typeof createGame>,
+  agentClientID: string,
+): AttackTarget[] {
+  const agent = game.playerByClientID(agentClientID);
+  if (agent === null) return [];
+  return agent
+    .nearby()
+    .map((p) =>
+      p.isPlayer()
+        ? { targetID: p.id(), smallID: p.smallID() }
+        : { targetID: null, smallID: null },
+    );
 }
 
 export function step(
@@ -190,6 +246,8 @@ export function step(
     done: winner !== null,
     winner,
     packedTileUpdates: state.packedTileUpdates,
-    packedPlayerUpdates: state.packedPlayerUpdates
+    packedPlayerUpdates: state.packedPlayerUpdates,
+    attackMask: computeAttackMask(game, session.agentClientID),
+    unitUpdates: state.unitUpdates,
   };
 }

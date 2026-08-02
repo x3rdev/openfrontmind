@@ -1,22 +1,17 @@
 import { parseArgs } from "node:util";
-import { GameMapType } from "../../engine/OpenFrontIO/src/core/game/Game";
 import { reset, step } from "./harness";
-import {startGame} from "../../engine/OpenFrontIO/src/client/LocalPersistantStats";
 
 async function main() {
   const { values } = parseArgs({
     options: {
-      map: { type: "string", default: "World" },
+      map: { type: "string", default: "big_plains" },
       ticks: { type: "string", default: "200" },
       seed: { type: "string", default: "seedseed" },
       bots: { type: "string", default: "50" },
     },
   });
 
-  const map = GameMapType[values.map as keyof typeof GameMapType];
-  if (map === undefined) {
-    throw new Error(`unknown --map "${values.map}"`);
-  }
+  const map = values.map as string;
   const ticks = Number(values.ticks);
   const bots = Number(values.bots);
   const seed = values.seed as string;
