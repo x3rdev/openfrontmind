@@ -10,21 +10,21 @@ from map_view import draw_units, outline_agent_territory, render
 
 def main(visualize: bool, seed: str, scale: int) -> None:
     with OpenFrontBridge() as bridge:
-        result = bridge.reset(seed=seed, bots=0, nations=1)
-        print("reset:", result)
-        agent_client_id = result["agentClientID"]
-        agent_small_id = result["agentSmallID"]
+        setup = bridge.reset(seed=seed, bots=0, nations=1)
+        print("reset:", setup)
+        agent_client_id = setup["agentClientID"]
+        agent_small_id = setup["agentSmallID"]
 
         if visualize:
             import cv2
 
             cv2.namedWindow("map")  # user-resizable window
-            width, height = result["width"], result["height"]
+            width, height = setup["width"], setup["height"]
             owner_grid = np.zeros((height, width), dtype=np.uint32)
             land_mask = np.zeros((height, width), dtype=bool)
             units: dict = {}
-            apply_tile_updates(owner_grid, land_mask, width, result["packedTileUpdates"])
-            apply_unit_updates(units, result["unitUpdates"])
+            apply_tile_updates(owner_grid, land_mask, width, setup["packedTileUpdates"])
+            apply_unit_updates(units, setup["unitUpdates"])
             img = render(owner_grid, land_mask, agent_small_id).to_bgr_uint8(scale=scale)
             draw_units(img, units, width, scale)
             cv2.imshow("map", outline_agent_territory(img, owner_grid, agent_small_id, scale))
@@ -50,21 +50,21 @@ def main(visualize: bool, seed: str, scale: int) -> None:
                     })
                     next_attack_at = i + ATTACK_COOLDOWN_TICKS
 
-                result = bridge.step(intents)
-                attack_mask = result["attackMask"]
-                tiles = result["packedTileUpdates"]
-                players = result["packedPlayerUpdates"]
+                setup = bridge.step(intents)
+                attack_mask = setup["attackMask"]
+                tiles = setup["packedTileUpdates"]
+                players = setup["packedPlayerUpdates"]
                 print(
-                    f"step {i}: tick={result['tick']} playersAlive={result['playersAlive']} "
-                    f"done={result['done']} winner={result['winner']} "
-                    f"attackMask={len(result['attackMask'])} "
+                    f"step {i}: tick={setup['tick']} playersAlive={setup['playersAlive']} "
+                    f"done={setup['done']} winner={setup['winner']} "
+                    f"attackMask={len(setup['attackMask'])} "
                     f"tileUpdates={tiles.shape if tiles is not None else None} "
                     f"playerUpdates={players.shape if players is not None else None}"
                 )
 
                 if visualize:
                     apply_tile_updates(owner_grid, land_mask, width, tiles)
-                    apply_unit_updates(units, result["unitUpdates"])
+                    apply_unit_updates(units, setup["unitUpdates"])
                     if i % 10 == 0:
                         img = render(owner_grid, land_mask, agent_small_id).to_bgr_uint8(scale=scale)
                         draw_units(img, units, width, scale)
@@ -74,8 +74,8 @@ def main(visualize: bool, seed: str, scale: int) -> None:
                         if cv2.waitKey(1) & 0xFF == ord("q"):
                             break
 
-                if result["done"]:
-                    print("game over, winner:", result["winner"])
+                if setup["done"]:
+                    print("game over, winner:", setup["winner"])
                     break
 
             # Captured before the blocking cv2.waitKey(0) below - otherwise
