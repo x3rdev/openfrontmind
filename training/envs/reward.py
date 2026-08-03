@@ -2,13 +2,6 @@ WIN_REWARD = 10000.0
 LOSS_REWARD = -10000.0
 
 
-def apply_player_updates(player_stats: dict, player_updates) -> None:
-    if player_updates is None:
-        return
-    for i in range(0, len(player_updates), 4):
-        small_id, tiles, gold, troops = player_updates[i:i+4]
-        player_stats[int(small_id)] = {"tilesOwned": tiles, "gold": gold, "troops": troops}
-
 def compute_reward(prev_stats: dict, curr_stats: dict, done: bool, won: bool) -> float:
     if done:
         return WIN_REWARD if won else LOSS_REWARD

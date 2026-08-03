@@ -48,3 +48,11 @@ def apply_unit_updates(units: dict, unit_updates: list | None) -> None:
             units.pop(u["id"], None)
         else:
             units[u["id"]] = u
+
+
+def apply_player_updates(player_stats: dict, player_updates) -> None:
+    if player_updates is None:
+        return
+    for i in range(0, len(player_updates), 4):
+        small_id, tiles, gold, troops = player_updates[i:i + 4]
+        player_stats[int(small_id)] = {"tilesOwned": tiles, "gold": gold, "troops": troops}

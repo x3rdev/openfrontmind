@@ -11,7 +11,7 @@ def encode_observation(owner_grid: np.ndarray, land_mask: np.ndarray, player_sta
         land_mask: bool, shape (H, W), same axis order as owner_grid. True
             where the tile is land.
         player_stats: {smallID: {"tilesOwned": float, "gold": float,
-            "troops": float}}, built by reward.apply_player_updates.
+            "troops": float}}, built by game_state.apply_player_updates.
         agent_small_id: the agent's own smallID (result["agentSmallID"]).
 
     Returns:
