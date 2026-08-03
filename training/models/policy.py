@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
@@ -38,6 +39,18 @@ class Agent(nn.Module):
         self.backbone = Backbone(height, width, scalar_dim)
         self.value_head = nn.Linear(256, 1)
         self.policy_head = nn.Linear(256, total_actions)
+
+    @classmethod
+    def from_observation(cls, spatial: np.ndarray, scalar: np.ndarray, mask: np.ndarray) -> "Agent":
+        """Build an Agent sized to match a real observation + action mask
+        (e.g. from encode_observation / build_action_mask) instead of
+        hand-passed dimensions - every dimension is read directly off real
+        data, none of them hand-typed or separately imported.
+        """
+        _, height, width = spatial.shape  # spatial is (C, H, W)
+        scalar_dim = scalar.shape[0]
+        total_actions = len(mask)
+        return cls(height=height, width=width, scalar_dim=scalar_dim, total_actions=total_actions)
 
     def get_value(self, spatial: torch.Tensor, scalar: torch.Tensor) -> torch.Tensor:
         return self.value_head(self.backbone(spatial, scalar))
