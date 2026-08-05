@@ -3,9 +3,9 @@ import time
 
 import numpy as np
 
-from bridge import OpenFrontBridge
-from game_state import apply_tile_updates, apply_unit_updates
-from map_view import draw_units, outline_agent_territory, render
+from training.envs.bridge import OpenFrontBridge
+from training.envs.game_state import apply_tile_updates, apply_unit_updates
+from training.envs.map_view import draw_units, outline_agent_territory, render
 
 
 def main(visualize: bool, seed: str, scale: int) -> None:

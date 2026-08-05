@@ -18,6 +18,16 @@ def _decode_packed(res: dict) -> dict:
     res["packedPlayerUpdates"] = _decode(res.get("packedPlayerUpdates"), np.float64)
     return res
 
+_built = False
+def _ensure_built():
+    global _built
+    if _built:
+        return
+    env_dir = REPO_ROOT / "env"
+    build = subprocess.run(["node", "build.mjs"], cwd=env_dir, capture_output=True, text=True)
+    if build.returncode != 0:
+        raise RuntimeError(f"env/ build failed:\n{build.stdout}{build.stderr}")
+    _built = True
 
 class OpenFrontBridge:
 
@@ -28,7 +38,7 @@ class OpenFrontBridge:
         self.process.terminate()
         self.process.wait()
 
-    def __init__(self, seed=None, map=None, bots=None, nations=None) -> None:
+    def __init__(self, seed=None, map=None, bots=None, nations=None, build=True) -> None:
         self.width = None
         self.height = None
         self.seed = seed
@@ -39,11 +49,8 @@ class OpenFrontBridge:
         # dist/server.mjs isn't rebuilt automatically otherwise, so a stale
         # build can silently keep running old harness.ts/server.ts logic.
         env_dir = REPO_ROOT / "env"
-        build = subprocess.run(
-            ["node", "build.mjs"], cwd=env_dir, capture_output=True, text=True,
-        )
-        if build.returncode != 0:
-            raise RuntimeError(f"env/ build failed:\n{build.stdout}{build.stderr}")
+        if build:
+            _ensure_built()
 
         self.process = subprocess.Popen(["node", str(env_dir / "dist" / "server.mjs")],
             stdin=subprocess.PIPE,
