@@ -23,13 +23,17 @@ def build_action_mask(attack_mask: list) -> tuple[np.ndarray, list]:
         None if unassigned. Player candidates beyond ATTACK_SLOTS are
         truncated (rare per testing).
     """
-    player_candidates = [c for c in attack_mask if c["targetID"] is not None]
-    has_wilderness = any(c["targetID"] is None for c in attack_mask)
+    # Skip candidates already under an active attack - re-selecting them would just
+    # reinforce it (AttackExecution merges troops into the existing attack rather than
+    # starting a fresh one), draining troop reserve for little to no extra effectiveness.
+    player_candidates = [
+        c for c in attack_mask if c["targetID"] is not None and not c["alreadyAttacking"]
+    ]
+    has_wilderness = any(
+        c["targetID"] is None and not c["alreadyAttacking"] for c in attack_mask
+    )
 
     candidates = player_candidates[:ATTACK_SLOTS]
-    if len(player_candidates) > ATTACK_SLOTS:
-        print(f"build_action_mask: truncating {len(player_candidates)} player candidates to {ATTACK_SLOTS}")
-
     num_candidates = len(candidates)
     slot_targets = [c["targetID"] for c in candidates] + [None] * (ATTACK_SLOTS - num_candidates)
 

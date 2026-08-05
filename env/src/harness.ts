@@ -200,6 +200,10 @@ export interface AttackTarget {
   // null targetID means unclaimed land ("wilderness") rather than a player.
   targetID: PlayerID | null;
   smallID: number | null;
+  // true if the agent already has an active outgoing attack toward this target -
+  // re-attacking would just reinforce it (AttackExecution merges troops into the
+  // existing attack), so this lets the Python side mask out the redundant reselect.
+  alreadyAttacking: boolean;
 }
 
 export interface StepResult {
@@ -213,6 +217,10 @@ export interface StepResult {
   unitUpdates?: UnitUpdate[];
 }
 
+// Sentinel key for wilderness in the active-attack set below - distinct from any
+// real PlayerID since those come from the engine's own ID space.
+const WILDERNESS_KEY = "__wilderness__";
+
 // nearby() is what the engine's own scripted AI uses too.
 function computeAttackMask(
   game: ReturnType<typeof createGame>,
@@ -220,12 +228,28 @@ function computeAttackMask(
 ): AttackTarget[] {
   const agent = game.playerByClientID(agentClientID);
   if (agent === null) return [];
+
+  const activeTargets = new Set(
+    agent
+      .outgoingAttacks()
+      .filter((a) => a.isActive())
+      .map((a) => (a.target().isPlayer() ? (a.target() as Player).id() : WILDERNESS_KEY)),
+  );
+
   return agent
     .nearby()
     .map((p) =>
       p.isPlayer()
-        ? { targetID: p.id(), smallID: p.smallID() }
-        : { targetID: null, smallID: null },
+        ? {
+            targetID: p.id(),
+            smallID: p.smallID(),
+            alreadyAttacking: activeTargets.has(p.id()),
+          }
+        : {
+            targetID: null,
+            smallID: null,
+            alreadyAttacking: activeTargets.has(WILDERNESS_KEY),
+          },
     );
 }
 

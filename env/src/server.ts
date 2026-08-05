@@ -23,6 +23,13 @@ function winnerToJSON(winner: Player | Team | null): string | null {
   return typeof winner === "string" ? winner : winner.name();
 }
 
+// null for a team win (Team has no smallID) or no winner yet - lets the
+// Python side look up the winner's PlayerType via reset()'s playerTypes map.
+function winnerSmallID(winner: Player | Team | null): number | null {
+  if (winner === null || typeof winner === "string") return null;
+  return winner.smallID();
+}
+
 function toBase64(
   arr: { buffer: ArrayBufferLike; byteOffset: number; byteLength: number } | undefined,
 ): string | null {
@@ -63,6 +70,7 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       packedTileUpdates: toBase64(session.state.packedTileUpdates),
       packedPlayerUpdates: toBase64(session.state.packedPlayerUpdates),
       unitUpdates: session.state.unitUpdates,
+      playerTypes: Object.fromEntries(session.game.players().map((p) => [p.smallID(), p.type()])),
     });
     return;
   }
@@ -82,6 +90,7 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       playersAlive: result.playersAlive,
       done: result.done,
       winner: winnerToJSON(result.winner),
+      winnerSmallID: winnerSmallID(result.winner),
       packedTileUpdates: toBase64(result.packedTileUpdates),
       packedPlayerUpdates: toBase64(result.packedPlayerUpdates),
       attackMask: result.attackMask,
