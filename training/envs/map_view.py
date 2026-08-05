@@ -3,17 +3,19 @@
 import cv2
 import numpy as np
 
-from raster import MaskedRaster
+from training.envs.raster import MaskedRaster
 
 WATER = (0.55, 0.75, 0.95)
 UNOWNED_LAND = (0.85, 0.83, 0.75)
 AGENT_COLOR = (1.0, 0.05, 0.05)  # bright red - not part of tab20, stands out
+BOT_COLOR = (0.5, 0.5, 0.5)  # equal RGB - flat gray, no colormap tint
 
 
 def render(
     owner_grid: np.ndarray,
     land_mask: np.ndarray,
     agent_small_id: int | None = None,
+    player_types: dict[int, str] | None = None,
 ) -> MaskedRaster:
     h, w = owner_grid.shape
     owned = land_mask & (owner_grid != 0)
@@ -22,6 +24,10 @@ def render(
         .fill(land_mask & (owner_grid == 0), UNOWNED_LAND)
         .fill_by_colormap(owned, owner_grid)
     )
+    if player_types:
+        bot_ids = [sid for sid, t in player_types.items() if t == "BOT"]
+        if bot_ids:
+            canvas.fill(owned & np.isin(owner_grid, bot_ids), BOT_COLOR)
     if agent_small_id is not None:
         canvas.fill(owner_grid == agent_small_id, AGENT_COLOR)
     return canvas
