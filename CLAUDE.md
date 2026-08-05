@@ -121,6 +121,78 @@ comes from running many independent OS processes rather than threads:
   closed-source API. Self-play is the practical data source; no imitation-learning
   bootstrap from human games planned.
 
+## Training run log
+
+Format: `update N` = training iteration count at that point. Stats, then verdict.
+
+- **Baseline (inherited).** `bots=25`, raw `delta_tiles` reward, `WIN/LOSS=±10000`,
+  `GAMMA=0.99`, `STEPS=500`, `ENTROPY_COEF=0.01`. Entropy 0.0000 from update 0.
+  `value_loss` 1e5-1e6. Wins: 0/~290. **Bug**: reward scale swamped shared-backbone
+  gradient via `VALUE_COEF`. Root-caused, not tuning.
+- **Fix: reward rescale.** `WIN/LOSS` →`±100`, fresh net. `value_loss` sane. Entropy no
+  longer permanently flat. Wins: 0/~900 (`bots=25`).
+- **Fix: `ENTROPY_COEF`** `0.01→0.05`. Entropy still mostly ~0. Wins: 0/~1300 combined.
+- **Fix: reward = fraction, curriculum start.** `delta_tiles`→`100×delta_tiles_fraction`.
+  `bots` `25→10`. Reward flat/slightly negative. Wins: 0/~1200.
+- **Fix: horizon match.** `GAMMA` `0.99→0.998` (horizon=`STEPS`=500). Entropy sustained
+  high (0.3-1.3+), no longer collapsing. Reward still flat. Wins: 0/~1300.
+- **Diagnostic (`bots=1`).** Greedy-policy episode: peak 62.5% map share at tick 95 →
+  full elimination by tick 1951 (~1850-tick decline). **Finding: horizon (500) way
+  short of decline arc (~1850) — value fn structurally can't connect peak to collapse.**
+- **Fix: lengthen horizon.** `STEPS` `500→2000`, `GAMMA` `0.998→0.9995` (horizon=2000).
+  Reward flipped ~100% positive, stable. Re-ran diagnostic: peak 62.8%@tick44 → 19.7%
+  final, lost to opponent hitting 80% (not elimination — holding measurably improved).
+- **Discovery: `nations=1` silently active all session** alongside every `bots=N`
+  tested — every run secretly included one strong Nation opponent too.
+- **Current: `bots=3, nations=1`.** Few weak Tribes (exploitable, low threat) + one
+  real Nation. Same `STEPS=2000`/`GAMMA=0.9995`/`ENTROPY_COEF=0.05`. Reward positive,
+  stable. Wins: 0 so far (early).
+
+## Game mechanics notes (learned this session, not obvious from a skim)
+
+- **Win condition**: control ≥80% of map tiles (`Config.percentageTilesOwnedToWin()`,
+  FFA), or a 170-min hard time cap → highest tile-share wins. Not last-player-standing.
+- **`bots` config param → Tribes** (weak: `TribeExecution.ts`, 129 lines, no navy/
+  nukes/diplomacy, attacks only every 40-80 ticks). **`nations` config param →
+  Nations** (strong: `NationExecution.ts` 372+ lines plus dedicated warship/nuke/
+  MIRV/alliance/structure behavior files).
+- **Attack troop cost**: `Config.attackAmount()` = 20% of current troops for
+  `PlayerType.Human` (us), 5% for `PlayerType.Bot`. Fresh cut taken on *every* new
+  attack intent — attacks never merge with an existing one toward the same target
+  (`PlayerImpl.createAttack` always makes a new `Attack`).
+- **Attack shape**: tile-claim order in `AttackExecution.addNeighbors` uses 4-
+  connectivity plus a priority that prefers tiles more enclosed by owned territory
+  (`numOwnedByMe`) — this smooths a *single sustained* attack into a circle over many
+  ticks. Our action space re-issues a fresh attack intent nearly every tick an attack
+  action is chosen, resetting this each time → jagged/square blobs, and risks
+  compounding troop depletion (each new attack takes 20% of an already-reduced pool).
+- **Gold**: passive per-tick income scaling with territory/workers
+  (`goldAdditionRate`) — no kill bonus; an eliminated player's remaining gold is
+  destroyed, not transferred to the attacker.
+- Troops/gold are already in the network's observation (`observation.py` scalar);
+  reward only uses tile fraction.
+
+## Known issues / next steps (not yet implemented)
+
+- **Redundant-attack masking.** Mask out re-attacking a target we already have an
+  active outgoing attack toward. Needs `computeAttackMask` (`env/src/harness.ts`) to
+  expose `agent.outgoingAttacks()` state, plus a `build_action_mask` change on the
+  Python side. Motivated by the troop-depletion + attack-shape finding above.
+- **Subprocess-level env parallelism.** N `OpenFrontBridge` subprocesses driven by a
+  Python `ThreadPoolExecutor` (blocking I/O releases the GIL, so threads suffice —
+  no need to rewrite `bridge.py` as asyncio), batching observations into one forward
+  pass per tick. `N` should be a tunable config value, not hardcoded. Prerequisite:
+  `OpenFrontBridge.__init__` currently reruns `node build.mjs` on *every*
+  instantiation — needs to happen once, shared, before fanning out N subprocesses.
+  Bundle the GPU migration with this step, not before — a batch-of-1 pipeline doesn't
+  benefit from GPU (sync/kernel-launch overhead dominates a network this small).
+- **Multi-horizon value heads** (idea, unimplemented): a second value head at a much
+  higher `GAMMA`, computed via a second GAE backward pass over the same rollout data.
+  Note: `GAMMA`'s effective reach is still capped by `STEPS` regardless of how high it
+  is set, since GAE only looks back within one rollout buffer — a long-horizon
+  `GAMMA` needs a correspondingly large `STEPS` to actually matter, not just a high
+  discount factor.
+
 ## Licensing note
 
 Upstream OpenFrontIO is AGPLv3 (network copyleft — matters only if we run a modified
