@@ -336,13 +336,6 @@ is set, since GAE only looks back within one rollout buffer — a long-horizon
 `GAMMA` needs a correspondingly large `STEPS` to actually matter, not just a high
 discount factor.
 
-**Architecture bottleneck (found via param-count check, not yet fixed):** the
-backbone flattens the conv output (25×25×32 at 200×200 input) straight into a
-`Linear(20003, 256)` — that one layer alone is ~5.12M of the network's ~5.3M total
-params, spatially-blind. Worth a global-pooling-based head instead of flatten,
-probably bundled with the observation-richness rewrite since both touch the backbone
-input shape anyway.
-
 **Operational gotcha (learned the hard way this session):** killing `train.py`'s main
 process does **not** cascade to its `VecOpenFrontBridge` worker processes or their
 Node subprocesses — the `with` block's cleanup never runs on a bare `kill`, so they
