@@ -4,7 +4,7 @@ import { reset, step } from "./harness";
 async function main() {
   const { values } = parseArgs({
     options: {
-      map: { type: "string", default: "big_plains" },
+      map: { type: "string", default: "mid_plains" },
       ticks: { type: "string", default: "200" },
       seed: { type: "string", default: "seedseed" },
       bots: { type: "string", default: "50" },

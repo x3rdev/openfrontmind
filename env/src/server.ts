@@ -8,7 +8,7 @@
 console.log = console.error;
 
 import readline from "node:readline";
-import { Player, Team } from "../../engine/OpenFrontIO/src/core/game/Game";
+import { Difficulty, isDifficulty, Player, Team } from "../../engine/OpenFrontIO/src/core/game/Game";
 import { StampedIntent } from "../../engine/OpenFrontIO/src/core/Schemas";
 import { HarnessSession, reset, step } from "./harness";
 
@@ -53,8 +53,9 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       typeof cmd.nations === "number" || cmd.nations === "default" || cmd.nations === "disabled"
         ? cmd.nations
         : undefined;
+    const difficulty = isDifficulty(cmd.difficulty) ? cmd.difficulty : undefined;
 
-    session = await reset(seed, map, bots, nations);
+    session = await reset(seed, map, bots, nations, difficulty);
     const agent = session.game.playerByClientID(session.agentClientID);
     send({
       cmd_success: true,

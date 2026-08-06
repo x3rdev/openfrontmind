@@ -84,9 +84,10 @@ export interface HarnessSession {
 
 export async function reset(
   seed: string = "seedseed",
-  map: string = "big_plains",
+  map: string = "mid_plains",
   bots: number = 50,
   nations: number | "default" | "disabled" = 5,
+  difficulty: Difficulty = Difficulty.Easy,
 ): Promise<HarnessSession> {
   const gameConfig: GameConfig = {
     // Cosmetic only - GameConfig.gameMap wants a GameMapType, but real
@@ -97,7 +98,7 @@ export async function reset(
     gameMapSize: GameMapSize.Normal,
     gameMode: GameMode.FFA,
     gameType: GameType.Public,
-    difficulty: Difficulty.Easy,
+    difficulty,
     nations,
     donateGold: false,
     donateTroops: false,

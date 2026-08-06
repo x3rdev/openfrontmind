@@ -38,13 +38,14 @@ class OpenFrontBridge:
         self.process.terminate()
         self.process.wait()
 
-    def __init__(self, seed=None, map=None, bots=None, nations=None, build=True) -> None:
+    def __init__(self, seed=None, map=None, bots=None, nations=None, difficulty=None, build=True) -> None:
         self.width = None
         self.height = None
         self.seed = seed
         self.map = map
         self.bots = bots
         self.nations = nations
+        self.difficulty = difficulty
 
         # dist/server.mjs isn't rebuilt automatically otherwise, so a stale
         # build can silently keep running old harness.ts/server.ts logic.
@@ -58,7 +59,7 @@ class OpenFrontBridge:
             text=True
         )
 
-    def reset(self, seed=None, map=None, bots=None, nations=None) -> dict:
+    def reset(self, seed=None, map=None, bots=None, nations=None, difficulty=None) -> dict:
         # Only include a field if the caller (or the constructor) actually
         # specified one - anything left as None is omitted, so harness.ts's
         # reset() applies its own default instead of it being shadowed here.
@@ -67,6 +68,7 @@ class OpenFrontBridge:
         map = map if map is not None else self.map
         bots = bots if bots is not None else self.bots
         nations = nations if nations is not None else self.nations
+        difficulty = difficulty if difficulty is not None else self.difficulty
         if seed is not None:
             cmd["seed"] = seed
         if map is not None:
@@ -75,6 +77,8 @@ class OpenFrontBridge:
             cmd["bots"] = bots
         if nations is not None:
             cmd["nations"] = nations
+        if difficulty is not None:
+            cmd["difficulty"] = difficulty
         res = self._send(cmd)
         self.width = res["width"]
         self.height = res["height"]
