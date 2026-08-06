@@ -113,7 +113,7 @@ def start_episode(bridge) -> EpisodeState:
     setup = bridge.reset(
         seed=str(random.randint(0, 2 ** 31 - 1)),
         map="mid_plains",
-        bots=3,
+        bots=0,
         nations=NATIONS
     )
     return _episode_state_from_setup(setup)
@@ -136,7 +136,11 @@ def run_update(
     rollout_start = time.perf_counter()
 
     n = len(episodes)
-    spatial_buf = np.zeros((STEPS, n, *episodes[0].spatial.shape), dtype=np.float32)
+    # bool, not float32 - spatial planes are binary (is_land/is_mine/is_enemy) and this
+    # buffer is STEPS*n*3*H*W, the single biggest allocation in the whole rollout by
+    # far; 4x smaller here is the difference between fitting in RAM and not on bigger
+    # maps. Cast back to float only for the per-minibatch GPU slice that needs it.
+    spatial_buf = np.zeros((STEPS, n, *episodes[0].spatial.shape), dtype=np.bool)
     scalar_buf = np.zeros((STEPS, n, *episodes[0].scalar.shape), dtype=np.float32)
     entities_buf = np.zeros((STEPS, n, *episodes[0].entities.shape), dtype=np.float32)
     entity_masks = np.zeros((STEPS, n, *episodes[0].entity_mask.shape), dtype=np.bool)
@@ -287,7 +291,7 @@ def run_update(
             batch_idx = indices[start:start+MINIBATCH_SIZE]
 
             new_action, new_log_prob, entropy, new_value = agent.get_action_and_value(
-                spatial=spatial_buf[batch_idx].to(DEVICE),
+                spatial=spatial_buf[batch_idx].to(DEVICE).float(),
                 scalar=scalar_buf[batch_idx].to(DEVICE),
                 entities=entities_buf[batch_idx].to(DEVICE),
                 entity_mask=entity_masks[batch_idx].to(DEVICE),
