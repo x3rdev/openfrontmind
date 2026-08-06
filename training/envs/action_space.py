@@ -1,60 +1,82 @@
-"""Fixed-size, maskable action space built on attackMask (harness.ts's
-computeAttackMask()).
+"""Entity-based action space built on attackMask (harness.ts's computeAttackMask()).
 
-Layout: ATTACK_SLOTS player slots, then a dedicated wilderness slot, then a
-dedicated do-nothing slot. Wilderness gets its own index rather than sharing
-the generic slots because attackMask marks it with targetID: None, which
-would otherwise be indistinguishable from an unassigned/padded slot.
+Each legal candidate this tick (bordering players, wilderness, do-nothing) becomes
+one row of a variable-length entity feature array, padded to MAX_ENTITIES for
+batching. The network scores each row by its own features via a pointer-style head
+(see policy.py) rather than by a fixed slot index - so unlike the old ATTACK_SLOTS
+scheme, "which row" carries no meaning of its own and doesn't need to be stable
+across ticks. do-nothing is folded in as a fixed all-zero-stats entity so one code
+path handles every candidate uniformly.
 """
 
 import numpy as np
 
-ATTACK_SLOTS = 10
-WILDERNESS_ACTION = ATTACK_SLOTS
-DO_NOTHING_ACTION = ATTACK_SLOTS + 1
-TOTAL_ACTIONS = ATTACK_SLOTS + 2
+# [is_tribe, is_nation, is_wilderness, is_do_nothing, tile_fraction, log_gold, log_troops]
+ENTITY_FEATURES = 7
+
+# Buffer-size cap, not a meaningful-identity cap like the old ATTACK_SLOTS - truncation
+# just means "ignore the least-relevant excess candidates this one tick," not "this
+# opponent permanently has no slot." Real candidate counts are expected to stay well
+# under this given map/opponent scale so far.
+MAX_ENTITIES = 16
+
+# Sentinel distinct from any real targetID (string) or wilderness's target (None).
+DO_NOTHING = object()
 
 
-def build_action_mask(attack_mask: list) -> tuple[np.ndarray, list]:
-    """Turn attackMask into (mask, slot_targets).
+def build_entities(
+    attack_mask: list, player_stats: dict, player_types: dict, total_land: float
+) -> tuple[np.ndarray, list]:
+    """Turn attackMask + current player stats into (features, targets).
 
-    mask: bool, shape (TOTAL_ACTIONS,) - legal actions this tick.
-    slot_targets: list of length ATTACK_SLOTS - targetID per player slot, or
-        None if unassigned. Player candidates beyond ATTACK_SLOTS are
-        truncated (rare per testing).
+    features: float32, shape (N, ENTITY_FEATURES) - N = live candidates this tick
+        (bordering players not already under attack, wilderness if available) plus
+        one for do-nothing (always legal, always last).
+    targets: list of length N - what to pass to action_to_intents for each row,
+        parallel to features.
     """
-    # Skip candidates already under an active attack - re-selecting them would just
-    # reinforce it (AttackExecution merges troops into the existing attack rather than
-    # starting a fresh one), draining troop reserve for little to no extra effectiveness.
-    player_candidates = [
-        c for c in attack_mask if c["targetID"] is not None and not c["alreadyAttacking"]
-    ]
-    has_wilderness = any(
-        c["targetID"] is None and not c["alreadyAttacking"] for c in attack_mask
-    )
+    rows = []
+    targets = []
+    for c in attack_mask:
+        if c["alreadyAttacking"]:
+            continue
+        if c["targetID"] is not None:
+            stats = player_stats.get(c["smallID"], {})
+            ptype = player_types.get(c["smallID"], "BOT")
+            rows.append([
+                float(ptype == "BOT"),
+                float(ptype == "NATION"),
+                0.0,
+                0.0,
+                stats.get("tilesOwned", 0.0) / max(total_land, 1),
+                float(np.log1p(stats.get("gold", 0.0))),
+                float(np.log1p(stats.get("troops", 0.0))),
+            ])
+            targets.append(c["targetID"])
+        else:
+            rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+            targets.append(None)
 
-    candidates = player_candidates[:ATTACK_SLOTS]
-    num_candidates = len(candidates)
-    slot_targets = [c["targetID"] for c in candidates] + [None] * (ATTACK_SLOTS - num_candidates)
+    rows.append([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    targets.append(DO_NOTHING)
 
-    mask = np.arange(ATTACK_SLOTS) < num_candidates
-    mask = np.append(mask, [has_wilderness, True])  # wilderness, then do-nothing
-
-    return mask, slot_targets
+    return np.array(rows, dtype=np.float32), targets
 
 
-def action_to_intents(action_idx: int, slot_targets: list, agent_client_id: str) -> list[dict]:
-    """Turn a sampled action index into an intents list for bridge.step().
+def pad_entities(features: np.ndarray, max_n: int = MAX_ENTITIES) -> tuple[np.ndarray, np.ndarray]:
+    """Pad/truncate (N, ENTITY_FEATURES) to a fixed (max_n, ENTITY_FEATURES) for
+    batching, plus a bool mask (max_n,) marking real (non-padding) rows."""
+    n = min(len(features), max_n)
+    padded = np.zeros((max_n, ENTITY_FEATURES), dtype=np.float32)
+    mask = np.zeros(max_n, dtype=bool)
+    padded[:n] = features[:n]
+    mask[:n] = True
+    return padded, mask
 
-    Falls back to [] for an unassigned player slot - shouldn't happen if
-    masking is correct, but safer than a malformed intent or a crash.
-    """
-    if action_idx == DO_NOTHING_ACTION:
-        return []
-    if action_idx == WILDERNESS_ACTION:
-        return [{"type": "attack", "targetID": None, "troops": None, "clientID": agent_client_id}]
 
-    target = slot_targets[action_idx]
-    if target is None:
+def action_to_intents(target, agent_client_id: str) -> list[dict]:
+    """Turn a chosen candidate's target (from `targets`, indexed by the sampled
+    action) into an intents list for bridge.step()."""
+    if target is DO_NOTHING:
         return []
     return [{"type": "attack", "targetID": target, "troops": None, "clientID": agent_client_id}]

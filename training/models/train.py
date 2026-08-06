@@ -10,13 +10,13 @@ import torch.optim
 from training.envs.vec_bridge import VecOpenFrontBridge
 from training.envs.game_state import apply_tile_updates, apply_player_updates
 from training.envs.observation import encode_observation
-from training.envs.action_space import build_action_mask, action_to_intents
+from training.envs.action_space import build_entities, pad_entities, action_to_intents, DO_NOTHING
 from training.envs.reward import compute_reward
 from training.models.policy import Agent
 
 STEPS = 2000
 NUM_UPDATES = 720  # ~8h overnight budget at the ~40s/update observed rate
-NUM_ENVS = 8
+NUM_ENVS = 24
 
 # Curriculum: start with one Nation opponent; if it's winning nearly every
 # game (not us, not a Tribe), the FFA field is too easy to dominate for it -
@@ -70,8 +70,9 @@ class EpisodeState:
     player_types: dict
     spatial: np.ndarray
     scalar: np.ndarray
-    mask: np.ndarray
-    slot_targets: list
+    entities: np.ndarray
+    entity_mask: np.ndarray
+    targets: list
 
 
 def _episode_state_from_setup(setup: dict) -> EpisodeState:
@@ -84,8 +85,10 @@ def _episode_state_from_setup(setup: dict) -> EpisodeState:
     apply_player_updates(player_stats, setup["packedPlayerUpdates"])
 
     agent_small_id = setup["agentSmallID"]
+    player_types = {int(sid): t for sid, t in setup["playerTypes"].items()}
     spatial, scalar = encode_observation(owner_grid, land_mask, player_stats, agent_small_id)
-    mask, slot_targets = build_action_mask([])
+    entity_features, targets = build_entities([], player_stats, player_types, land_mask.sum())
+    entities, entity_mask = pad_entities(entity_features)
 
     return EpisodeState(
         width=width,
@@ -96,11 +99,12 @@ def _episode_state_from_setup(setup: dict) -> EpisodeState:
         agent_client_id=setup["agentClientID"],
         agent_small_id=agent_small_id,
         agent_name=setup["agentName"],
-        player_types={int(sid): t for sid, t in setup["playerTypes"].items()},
+        player_types=player_types,
         spatial=spatial,
         scalar=scalar,
-        mask=mask,
-        slot_targets=slot_targets,
+        entities=entities,
+        entity_mask=entity_mask,
+        targets=targets,
     )
 
 
@@ -108,7 +112,7 @@ def start_episode(bridge) -> EpisodeState:
     """Used for standalone scripts and per-slot resets in run_update."""
     setup = bridge.reset(
         seed=str(random.randint(0, 2 ** 31 - 1)),
-        map="big_plains",
+        map="mid_plains",
         bots=3,
         nations=NATIONS
     )
@@ -134,24 +138,28 @@ def run_update(
     n = len(episodes)
     spatial_buf = np.zeros((STEPS, n, *episodes[0].spatial.shape), dtype=np.float32)
     scalar_buf = np.zeros((STEPS, n, *episodes[0].scalar.shape), dtype=np.float32)
-    masks = np.zeros((STEPS, n, *episodes[0].mask.shape), dtype=np.bool)
+    entities_buf = np.zeros((STEPS, n, *episodes[0].entities.shape), dtype=np.float32)
+    entity_masks = np.zeros((STEPS, n, *episodes[0].entity_mask.shape), dtype=np.bool)
     actions = np.zeros((STEPS, n))
     log_probs = np.zeros((STEPS, n))
     values = np.zeros((STEPS, n))
     rewards = np.zeros((STEPS, n))
     dones = np.zeros((STEPS, n), dtype=np.bool)
     wins = np.zeros((STEPS, n), dtype=np.bool)
+    episode_end_golds = []
 
     for i in range(STEPS):
         spatial_batch = np.stack([e.spatial for e in episodes])
         scalar_batch = np.stack([e.scalar for e in episodes])
-        mask_batch = np.stack([e.mask for e in episodes])
+        entity_batch = np.stack([e.entities for e in episodes])
+        entity_mask_batch = np.stack([e.entity_mask for e in episodes])
 
         with torch.no_grad():
             action, log_prob, entropy, value = agent.get_action_and_value(
                 spatial=torch.from_numpy(spatial_batch).to(DEVICE),
                 scalar=torch.from_numpy(scalar_batch).to(DEVICE),
-                mask=torch.from_numpy(mask_batch).to(DEVICE),
+                entities=torch.from_numpy(entity_batch).to(DEVICE),
+                entity_mask=torch.from_numpy(entity_mask_batch).to(DEVICE),
                 action=None
             )
         actions_np = action.cpu().numpy()
@@ -160,8 +168,7 @@ def run_update(
 
         intents_list = [
             action_to_intents(
-                action_idx=int(actions_np[k]),
-                slot_targets=episodes[k].slot_targets,
+                target=episodes[k].targets[actions_np[k]] if actions_np[k] < len(episodes[k].targets) else DO_NOTHING,
                 agent_client_id=episodes[k].agent_client_id,
             )
             for k in range(n)
@@ -179,7 +186,8 @@ def run_update(
             prev_stats = episode.player_stats.get(episode.agent_small_id, {})
             spatial_buf[i, k] = episode.spatial
             scalar_buf[i, k] = episode.scalar
-            masks[i, k] = episode.mask
+            entities_buf[i, k] = episode.entities
+            entity_masks[i, k] = episode.entity_mask
             actions[i, k] = actions_np[k]
             log_probs[i, k] = log_probs_np[k]
             values[i, k] = values_np[k]
@@ -202,23 +210,34 @@ def run_update(
             episode.spatial, episode.scalar = encode_observation(
                 episode.owner_grid, episode.land_mask, episode.player_stats, episode.agent_small_id
             )
-            episode.mask, episode.slot_targets = build_action_mask(attack_mask)
+            entity_features, episode.targets = build_entities(
+                attack_mask, episode.player_stats, episode.player_types, episode.land_mask.sum()
+            )
+            episode.entities, episode.entity_mask = pad_entities(entity_features)
 
             # reset just this slot - the others keep ticking independently
             if done:
+                # gold at the moment a game ends - the action space has no way to
+                # spend it yet, so this tracks how much is piling up unused
+                episode_end_golds.append(curr_stats.get("gold", 0.0))
                 episodes[k] = start_episode(vec_bridge.bridges[k])
 
     with torch.no_grad():
         last_spatial = np.stack([e.spatial for e in episodes])
         last_scalar = np.stack([e.scalar for e in episodes])
+        last_entities = np.stack([e.entities for e in episodes])
+        last_entity_mask = np.stack([e.entity_mask for e in episodes])
         last_value = agent.get_value(
             spatial=torch.from_numpy(last_spatial).to(DEVICE),
             scalar=torch.from_numpy(last_scalar).to(DEVICE),
+            entities=torch.from_numpy(last_entities).to(DEVICE),
+            entity_mask=torch.from_numpy(last_entity_mask).to(DEVICE),
         ).squeeze(-1).cpu()
 
     spatial_buf = torch.from_numpy(spatial_buf)
     scalar_buf = torch.from_numpy(scalar_buf)
-    masks = torch.from_numpy(masks)
+    entities_buf = torch.from_numpy(entities_buf)
+    entity_masks = torch.from_numpy(entity_masks)
     actions = torch.from_numpy(actions)
     log_probs = torch.from_numpy(log_probs)
     values = torch.from_numpy(values)
@@ -246,11 +265,13 @@ def run_update(
     total = STEPS * n
     spatial_buf = spatial_buf.reshape(total, *spatial_buf.shape[2:])
     scalar_buf = scalar_buf.reshape(total, *scalar_buf.shape[2:])
-    masks = masks.reshape(total, *masks.shape[2:])
+    entities_buf = entities_buf.reshape(total, *entities_buf.shape[2:])
+    entity_masks = entity_masks.reshape(total, *entity_masks.shape[2:])
     actions = actions.reshape(total)
     log_probs = log_probs.reshape(total)
     advantages = advantages.reshape(total)
     returns = returns.reshape(total)
+    values = values.reshape(total)
 
     rollout_elapsed = time.perf_counter() - rollout_start
     ppo_start = time.perf_counter()
@@ -268,20 +289,33 @@ def run_update(
             new_action, new_log_prob, entropy, new_value = agent.get_action_and_value(
                 spatial=spatial_buf[batch_idx].to(DEVICE),
                 scalar=scalar_buf[batch_idx].to(DEVICE),
-                mask=masks[batch_idx].to(DEVICE),
+                entities=entities_buf[batch_idx].to(DEVICE),
+                entity_mask=entity_masks[batch_idx].to(DEVICE),
                 action=actions[batch_idx].to(DEVICE)
             )
 
             batch_log_probs = log_probs[batch_idx].to(DEVICE)
             batch_advantages = advantages[batch_idx].to(DEVICE)
             batch_returns = returns[batch_idx].to(DEVICE)
+            batch_old_values = values[batch_idx].to(DEVICE)
 
             ratio = torch.exp(new_log_prob-batch_log_probs)
             unclipped = ratio * batch_advantages
             clipped = torch.clamp(ratio, 1-CLIP_EPS, 1+CLIP_EPS) * batch_advantages
 
             policy_loss = -torch.min(unclipped, clipped).mean()
-            value_loss = torch.square(new_value.squeeze(-1) - batch_returns).mean()
+
+            # same clip-and-take-worse-case idea as the policy ratio above, applied to
+            # the value regression - caps how far one epoch can drag the value estimate
+            # for a given state from what it was at rollout time, instead of letting a
+            # rare high-variance return (e.g. a just-completed win/loss) yank it freely
+            new_value = new_value.squeeze(-1)
+            value_clipped = batch_old_values + torch.clamp(
+                new_value - batch_old_values, -CLIP_EPS, CLIP_EPS
+            )
+            value_loss_unclipped = torch.square(new_value - batch_returns)
+            value_loss_clipped = torch.square(value_clipped - batch_returns)
+            value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
             entropy_bonus = entropy.mean()
 
@@ -298,6 +332,7 @@ def run_update(
 
     episodes_finished = int(dones.sum().item())
     episode_wins = int(wins.sum().item())
+    mean_gold_at_done = sum(episode_end_golds) / len(episode_end_golds) if episode_end_golds else 0.0
 
     ppo_elapsed = time.perf_counter() - ppo_start
     total_elapsed = rollout_elapsed + ppo_elapsed
@@ -306,6 +341,7 @@ def run_update(
     print(
         f"update {update}: mean_reward={rewards.mean().item():.3f} "
         f"episodes_finished={episodes_finished} wins={episode_wins} "
+        f"mean_gold_at_done={mean_gold_at_done:,.0f} "
         f"policy_loss={policy_loss_sum / num_minibatches:.4f} "
         f"value_loss={value_loss_sum / num_minibatches:.4f} "
         f"entropy={entropy_sum / num_minibatches:.4f} "
@@ -320,7 +356,7 @@ def train():
     with VecOpenFrontBridge(NUM_ENVS) as vec_bridge:
         episodes = start_all_episodes(vec_bridge)
 
-        agent = Agent.from_observation(episodes[0].spatial, episodes[0].scalar, episodes[0].mask).to(DEVICE)
+        agent = Agent.from_observation(episodes[0].spatial, episodes[0].scalar, episodes[0].entities).to(DEVICE)
         checkpoint = latest_checkpoint()
         if checkpoint is not None:
             agent.load_state_dict(torch.load(checkpoint, map_location=DEVICE))
