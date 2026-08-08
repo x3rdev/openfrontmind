@@ -390,7 +390,12 @@ The patient-heuristic result is a ceiling to validate against, not a target
 behavior to bake into the reward function. If credit assignment is still too weak
 to learn this after the fixes above, the principled fallback is potential-based
 reward shaping (Ng et al. 1999) - provably policy-invariant, unlike an ad hoc
-patience bonus - not yet implemented.
+patience bonus. **Implemented since** (`reward.py`): `_troop_potential(ratio) =
+-(ratio - TROOP_RATIO_TARGET)²`, shaping = `SHAPING_COEF * (gamma*Φ(curr) -
+Φ(prev))`. `SHAPING_COEF` raised `0.1 → 0.3 → 1.0` over the session in response to
+diagnostics (see below) still showing near-zero attack-time troop ratios - see the
+"low-outcome-diversity stalemate" finding below for why coefficient tuning alone
+turned out not to be the resolving lever.
 
 **Throughput — async actor/learner overlap (IMPALA-style), likely bigger than more
 `NUM_ENVS` tuning.** Rollout and PPO currently run strictly sequentially within one
@@ -448,6 +453,143 @@ isn't one - the Node subprocesses' own stdout (game-end messages) is a separate,
 unbuffered fd and shows up immediately, which is a useful tell: log growing on game
 events but silent on `update` lines means it's buffering, not stuck. Launch with
 `python -u -m training.models.train` (or `PYTHONUNBUFFERED=1`) to see progress live.
+
+**Diagnostic tooling added to `watch.py`: `--diagnostic`, `--log-probs`,
+`--log-value`, `--headless`.** None of the training-time metrics (win rate,
+mean_reward) could distinguish *why* the policy was stuck, so three per-tick tracing
+modes were added on top of the existing GUI replay:
+- `--diagnostic`: tracks troop_ratio/tile_fraction at decision time, counts
+  do_nothing vs. attack actions, first-attack tick/ratio, mean attack-time
+  troop_ratio, peak tile share.
+- `--log-probs`: exposes the actual softmax probability of `do_nothing` vs.
+  attacking (`get_action_and_value(..., return_probs=True)`), bucketed by
+  troop_ratio decile at the end of the game.
+- `--log-value`: traces `V(s)` per tick plus its correlation with tick number,
+  troop_ratio, and tile_fraction.
+- `--headless`: skips the `cv2` window so these run unattended; `--seed` accepts a
+  comma-separated list to aggregate across multiple games.
+
+**Bug found via the diagnostics themselves: `watch.py` never applied the same
+elimination-is-terminal rule `train.py` uses.** `train.py`'s `run_update()` already
+treats `tilesOwned == 0` as done (the wider FFA game runs long after our agent is
+wiped out) - `watch.py`'s standalone loop had no equivalent, so after the agent died
+it kept "observing" a dead player whose `troops`/`maxTroops` go stale/degenerate
+(`troop_ratio` showing as a nonsensical `9999.0`), polluting the diagnostic buckets
+(one run's `[0.9,1.0)` bucket was ~1900 samples of this artifact, not real high-ratio
+patience). Fixed by mirroring `train.py`'s check.
+
+**Second real bug found: `watch.py` had silently drifted from what `train.py`
+actually trains against.** It hardcoded `bridge.reset(..., bots=3, nations=1)` while
+`train.py` was training on `bots=0, nations=1` - every diagnostic that session had
+been run against a harder, different opponent mix than the checkpoint was ever
+trained on. Fixed by importing `BOTS`/`NATIONS` (and later `DIFFICULTY`) from
+`train.py` as defaults, overridable via new `--bots`/`--nations`/`--difficulty`
+flags, so the two scripts can no longer silently diverge.
+
+**Diagnostic result (update~224, `SHAPING_COEF=0.3`): greedy, not patient.** 5/5
+games lost. Every game's first attack landed at tick 1-4, troop_ratio ≈ 0.21 (the
+starting value) on every seed. `mean_attack_troop_ratio` 0.004-0.014 - the policy
+spends troops as fast as they regenerate rather than letting the ratio climb toward
+the 0.422 target. Peak tile share 11-39%. Bumped `SHAPING_COEF` `0.3→1.0` in
+response.
+
+**Re-diagnosed with `--log-probs` after the coefficient bump: more nuanced than "no
+learning."** `p(do_nothing)` climbs from ~0.6-0.77 near troop_ratio=0 to ~0.93-1.00
+above troop_ratio≈0.1-0.2, consistent across 3 seeds - a real, graded,
+state-conditioned relationship, not the flat/greedy pattern the raw action counts
+alone suggested. Two problems remained visible in the same data: (1) every game
+still opens with an attack at tick 1-4 regardless of state - looks like a fixed
+habit, not a decision; (2) even below troop_ratio 0.1, `p(attack)` is still 23-39% -
+sampled every tick, that's enough to keep re-crashing the ratio before it can climb,
+which is why `mean_attack_troop_ratio` stays pinned near zero and peak tile share
+caps at 13-18%.
+
+**`--log-value` result: still time-dominated, not state-aware, even after the
+troop_ratio fix.** Across 3 seeds: `corr(V, tick)` ≈ -0.95 to -0.98 (strong,
+consistent). `corr(V, troop_ratio)` weak and **sign-flips** between seeds (-0.46,
+-0.57, +0.64) - troop_ratio isn't reliably driving V's shape, tick still is.
+Concretely: in 2/3 seeds troop_ratio climbed to 0.85-0.92 by the end, yet V stayed
+flat/pinned near its floor rather than recovering. Honest caveat: all 3 traced games
+ended in losses, so a value function correctly predicting an already-doomed
+trajectory would *also* show this pattern (discount horizon shrinking toward a fixed
+terminal reward) - can't fully rule that out without a winning trajectory to compare
+against, which is hard to get at ~3% win rate.
+
+**Diagnosis: a low-outcome-diversity stalemate, not (primarily) a reward-magnitude
+problem.** If ~97% of episodes end in a loss regardless of how troop_ratio/tile_
+fraction fluctuate mid-game, the value function's training data genuinely doesn't
+contain a strong troop_ratio→return relationship to learn - the one thing that *does*
+reliably predict return is "closeness to the end," so V settles into tracking tick.
+That starves PPO's advantage estimate (`return - V(s)`) of useful signal specifically
+where troop_ratio should matter, so the policy gets weak gradient pressure to learn
+patience even though the reward shaping is nominally pushing for it. Measured
+confirmation that reward-tuning wasn't the lever: relative L2 weight distance
+between checkpoints 32 updates apart was ~0.19-0.23 regardless of whether a
+`SHAPING_COEF` change happened in that window - the coefficient bump didn't move the
+network any more than ordinary continued training does.
+
+**Curriculum experiment: `bots=1, nations=0` (weak Tribe instead of a Nation), tried
+and reverted.** Rationale: get real winning trajectories flowing so the value
+function has outcome-diverse data to learn from. Immediate result: 4/8 wins at
+update 0 (vs. ~3% against a Nation) - confirms opponent strength, not task
+difficulty, was gating outcome diversity. **Reverted** after reasoning it through:
+Tribes barely fight back (`TribeExecution.ts` - no navy/nukes/diplomacy, attacks
+every 40-80 ticks), so the existing greedy/spam-attack habit already wins against
+them - PPO would reinforce spamming as "correct" rather than push toward the
+patience actually needed, the opposite lesson from what's intended. Back to
+`bots=0, nations=1`.
+
+**Difficulty was always implicitly `Easy` - made explicit.** `train.py` never set
+`difficulty` in `bridge.reset()`; `harness.ts`'s default (`Difficulty.Easy`, 0.5x
+Nation troop strength) was silently in effect the whole session, including for the
+6/6 patience-heuristic diagnostic. So the "hoard to 100%, never strike" and "spam
+constantly" failure modes aren't a too-hard-opponent problem - patience-then-strike
+is proven achievable at exactly this difficulty. Set `DIFFICULTY = "Easy"`
+explicitly in both `train.py` and `watch.py` (same fix pattern as the `bots`/
+`nations` drift bug above) so it can't silently change later.
+
+**Root cause identified: the entangled action softmax.** `do_nothing` was scored as
+just one row among however many attack candidates (`policy.py`'s old
+`get_action_and_value` fed every entity, `do_nothing` included, into one
+`Categorical`). `p(do_nothing) = exp(score_dn) / Σ exp(score_i)` over *every* live
+candidate that tick - so the same learned preference for waiting produces a
+different actual probability depending on how crowded the board happens to be,
+entangling "should I act at all" with "which target" instead of keeping them as two
+separable decisions. Gets *worse*, not better, once non-troop actions (buildings)
+are added, since they'd just be more rows in the same shared softmax.
+
+**Fix: gated action head.** `policy.py`'s `Agent` gained `gate_head: Linear(256,
+2)` - a dedicated binary wait-vs-act decision, computed once per tick from the
+backbone hidden state. Target selection (`query_proj` + the pointer-style
+entity-embedding dot product, unchanged) now scores only real (non-`do_nothing`)
+candidates; the gate is forced to "wait" when no legal target exists. Log-prob/
+entropy of the joint action are computed via the exact hierarchical decomposition
+(`H(joint) = H(gate) + P(act)·H(target|act)`, log-prob similarly gated by whether
+the sampled/given action was the `do_nothing` index) - verified via a standalone
+smoke test before touching real training: probabilities sum to 1, the forced-wait
+edge case behaves correctly, log_prob is self-consistent between the just-sampled
+and PPO-recompute code paths, and gradients flow through all parameters cleanly.
+`get_action_and_value`'s external signature (and `return_probs`'s flattened
+per-entity output, for `watch.py`'s `--log-probs`) is unchanged, so no other call
+site needed to change.
+
+**`train.py` checkpoint loading now supports a partial (warm) resume.**
+`agent.load_state_dict(checkpoint["model"], strict=False)` instead of a strict
+load, so an architecture change like adding `gate_head` can carry over every weight
+that still matches (backbone, entity encoder, value head, query projection) instead
+of forcing a full reset - verified bit-exact transfer of all matching layers against
+a real checkpoint before trusting it. **Not currently in use**: reset to fresh
+(cold-start) weights instead, deliberately, to isolate the effect of the new action
+representation from any confound of a warm-started backbone trained under the old
+entangled-softmax scheme. The warm-start path stays available for later.
+
+**Current state: fresh training run, gated action head, `bots=0, nations=1,
+difficulty=Easy`, cold-started weights.** Old checkpoints archived (not deleted) to
+`training/models/checkpoints_pre_gatedaction_<timestamp>/`. **Not yet validated**:
+whether the gated head actually fixes the patience/hoarding problem - that needs the
+same `--diagnostic`/`--log-probs`/`--log-value` methodology re-run once this has had
+enough updates to say something, plus the trained-vs-dumb-baseline comparison used
+to catch the original stuck-learning bug.
 
 ## Licensing note
 

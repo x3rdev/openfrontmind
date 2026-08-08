@@ -198,14 +198,114 @@ ticks. Re-benchmarked: real scaling now shows up to `NUM_ENVS=24` (925 ticks/sec
 with a hard falloff by 32 (629 — a 16-core machine oversubscribed 2x). `NUM_ENVS`
 set to 24.
 
+### Phase 14 — First full-scale run, and a new diagnostic toolkit
+
+The first run at real settings (`STEPS=3000`, `NUM_ENVS=24`) failed before it even
+started: the spatial rollout buffer was allocated `float32` for what are purely
+binary planes, trying to claim 48GB on a 31GB machine. Fixed by storing it as `bool`
+(lossless — the values are always exactly 0 or 1), a 4x reduction with no precision
+cost.
+
+With that fixed, the run itself exposed a harder problem: win rate stayed near zero
+for hundreds of updates, and neither the training log nor a game replay explained
+*why*. So `watch.py` grew three new diagnostic modes to answer that directly instead
+of guessing:
+
+- `--diagnostic` — troop_ratio/tile_fraction at decision time, attack vs. wait
+  counts, first-attack timing.
+- `--log-probs` — the policy's actual `p(wait)` vs. `p(attack)`, bucketed by
+  troop_ratio.
+- `--log-value` — `V(s)` traced tick-by-tick, correlated against tick number,
+  troop_ratio, and tile share.
+
+Two bugs turned up immediately while building these: `watch.py` didn't know an
+eliminated agent should end the episode (the wider game keeps running after our
+agent is wiped out — `train.py` already handled this, `watch.py` didn't, so it kept
+"observing" a dead player's stale stats), and `watch.py` had silently drifted to a
+different opponent mix (`bots=3, nations=1`) than what `train.py` actually trained
+on (`bots=0, nations=1`) — every diagnostic run before the fix had been measuring
+the wrong thing.
+
+With clean tooling, the actual picture came into focus:
+
+| check | result |
+|---|---|
+| action pattern | attacks within tick 1-4 of *every* game, troop_ratio ≈ 0.21 (starting value), regardless of seed |
+| `p(wait)` vs. troop_ratio | real and graded — 0.6-0.77 near ratio=0, rising to 0.93-1.00 above ratio≈0.1-0.2 |
+| but | `p(attack)` never fully dies out below ratio 0.1 (23-39%) — enough to keep re-crashing troops before they can accumulate |
+| `corr(V, tick)` | -0.95 to -0.98, strong and consistent across seeds |
+| `corr(V, troop_ratio)` | weak and **sign-flipping** between seeds (-0.46, -0.57, +0.64) |
+
+Not "no learning" — a real, state-conditioned preference for patience exists. But
+the value function still can't reliably tell a strong position from a weak one, and
+a residual habit of attacking near-zero troops keeps undoing whatever patience the
+policy has learned. Root-cause read: if ~97% of episodes end in a loss regardless of
+how troop_ratio moves mid-game, there's no strong troop_ratio→outcome relationship
+in the training data for the value function to learn — it falls back to tracking
+"how close to the end" instead, which starves the policy's advantage estimate of
+useful signal exactly where it matters.
+
+### Phase 15 — A curriculum experiment, tried and deliberately reverted
+
+If the problem is too few winning outcomes to learn from, the direct fix is a
+weaker opponent. Swapping to a single weak Tribe (`bots=1, nations=0`) confirmed
+this immediately — 4 wins out of 8 episodes at update 0, versus ~3% against a
+Nation.
+
+But it was reverted on reflection, not kept: Tribes barely fight back (no navy,
+nukes, or diplomacy; they attack every 40-80 ticks), so the policy's existing
+greedy/spam-attack habit *already* beats them. Training against it would reinforce
+spamming as "correct" rather than teach the patience actually needed against real
+competition — the opposite lesson, arrived at by the easy path.
+
+A smaller, useful discovery along the way: `train.py` had never explicitly set
+match difficulty, so training (and even the Phase 12 patience-heuristic diagnostic)
+had been running against `Difficulty.Easy` Nations the whole time by silent
+default. That's reassuring in one sense — patience-then-strike is proven achievable
+at exactly this difficulty — and it ruled out "make the opponent easier" as a
+further lever, since there's no easier standard tier to drop to. Difficulty is now
+set explicitly rather than relying on an implicit default.
+
+### Phase 16 — The actual structural bug, and the fix
+
+The deeper cause behind both the attack-near-zero leak and the value function's
+blindness turned out to be architectural, not a reward or curriculum problem:
+`do_nothing` was scored as just one row in a single softmax alongside however many
+attack candidates existed that tick. Its probability was `exp(score) / Σ exp(all
+scores)` — so the *same* learned preference for waiting produced a different actual
+probability depending on how crowded the board happened to be. "Should I act at
+all" and "which target" were entangled into one decision instead of being
+separable, and this would only get worse as more action types (buildings) are
+added.
+
+The fix: a dedicated gated action head. The policy now makes a genuine binary
+wait-vs-act decision first, from a small new `gate_head`, independent of how many
+attack candidates exist; target selection (unchanged pointer-network scoring) only
+runs among real candidates once the gate says "act." Verified via a standalone
+smoke test — probability mass sums to 1, the "no legal target" edge case forces the
+correct wait, and log-probs stay self-consistent between the sampling and PPO
+recompute paths — before ever touching a real training run.
+
+Training was reset to fresh weights on the clean baseline (`bots=0, nations=1,
+difficulty=Easy`) this diagnosis converged on, to isolate the effect of the new
+action representation from any confound of a backbone trained under the old
+entangled scheme. (A partial-load warm-start path — carrying over every layer that
+still matches an old checkpoint, only randomly initializing the new `gate_head` —
+was built and verified too, and stays available for later.) Old checkpoints
+archived, not discarded. **Not yet validated**: whether the gated head actually
+closes the patience gap — that's the next real test, using the same diagnostic
+toolkit that caught the problem in the first place.
+
 ## What's next
 
-- A real training run at the fixed throughput + entity-encoder + troop-ratio
-  observation, to see if the stuck-learning symptom is actually resolved.
+- Re-run the `--diagnostic`/`--log-probs`/`--log-value` toolkit against the gated
+  action head once it's had enough updates to say something, plus the
+  trained-vs-dumb-baseline comparison that caught the original stuck-learning bug.
 - Async actor/learner overlap for throughput (bigger lever than env count).
 - Buildings and economy actions, once the agent can reliably survive long enough to
   spend the gold it hoards (currently ~135K per game, unspent, in an attack-only
-  action space).
+  action space) — and once the gated action head is validated, since a third action
+  family would otherwise just add a new dimension to the same entanglement problem.
 
 ## Credits / license
 
