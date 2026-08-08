@@ -319,6 +319,79 @@ to be far more cramped than a typical real game: The Box, a real production map,
 by clicking alone, which the same policy could not reproduce on `big_plains`'s denser
 `bots=3, nations=1` setup.
 
+**Entity-encoder re-validation at 500 updates: still ≈ dumb baseline.** Ran the same
+trained-vs-dumb comparison that caught the original bug, this time against the new
+entity-encoder architecture on `bots=0, nations=1` (500 updates, `NUM_ENVS=8`).
+Result: peak tile share matched within ~0.5 points on every seed, peak ticks matched
+exactly on 3 of 4, every game lost to the identical opponent. **The entity encoder
+fixed the action-slot-instability bug but did not fix the stuck-learning symptom** -
+something else is the dominant cause.
+
+**Value trace: the value head learned tick number, not game state.** Traced `V(s)`
+tick-by-tick through one real game (trained policy, 500 updates). It declined
+smoothly and almost monotonically for the *entire* episode - including during the
+first ~140 ticks while tile share was still climbing from 39% to 78.5% (peak). It
+kept declining at essentially the same rate through the peak, the collapse, and a
+long flat-ish middle stretch where tile share was actually just oscillating, not
+declining. That's the signature of a value function outputting "generic expected
+return at this point in time" rather than "expected return given this board state" -
+which explains why `value_loss` can drop cleanly (fitting a smooth time curve is
+easy) while the *policy* shows zero improvement: PPO's advantage (`return - value`)
+can't isolate whether a specific action was good if the baseline isn't state-aware.
+
+**Missing feature found via this: troop ratio, not raw troop count.** Observation
+only ever exposed raw (log-transformed) troop count - never `maxTroops`, so the
+network had no way to compute the ratio the engine's *own* scripted AI gates on
+(`AiAttackBehavior.ts`'s `hasReserveRatioTroops()` uses `troops()/maxTroops()`
+directly). Raw troop count also grows with elapsed game time almost regardless of
+strategy, which is exactly the kind of feature that lets a value function cheat
+toward predicting via tick number instead of state. Fixed: `maxTroops` now travels
+as a plain JSON side-channel every tick (`server.ts`, not the packed binary stream
+used by the real game client), merged into `player_stats` via a new
+`apply_max_troops()`, and both the agent's own scalar and each entity's gold field
+now use `troops/maxTroops` instead of raw log-troops.
+
+**Gold now normalized via a running mean/std** (`training/envs/running_stats.py`,
+`RunningMeanStd` - Welford's online algorithm), not just `log1p`-transformed.
+Updated from real observations only (wilderness/do-nothing placeholder rows carry a
+fixed `0.0` in the gold column that would otherwise bias the mean). Persisted inside
+the checkpoint (`gold_mean`/`gold_var`/`gold_count` alongside `model`) so a resumed
+run or `watch.py` normalizes with the exact statistics the weights were trained
+against, not a freshly-reset estimate - this also fixed a real ordering bug where
+episodes were being built (and normalized) *before* a resumed checkpoint's stats
+were restored.
+
+**Decisive diagnostic: patience alone wins 6/6, greedy attack loses 6/6.** Built a
+second hardcoded (non-learning) heuristic - do nothing until `troops/maxTroops`
+crosses 50%, then attack - and ran it against the original always-attack-when-
+possible heuristic on 6 identical seeds (`bots=0, nations=1`, `mid_plains`). Patient
+heuristic: 6/6 WIN, peak ~80-81%. Greedy heuristic: 6/6 LOSS, peak 72-76% then
+decline. Same action space, same map, same opponent, zero learning involved either
+way. **This disproves the "action space has a structural ceiling, buildings are
+required" hypothesis from earlier in the session** - patience-then-strike is fully
+achievable with attack + do-nothing alone. It also hands a concrete, mechanically-
+verified ceiling to hold the trained policy against (100% win rate, ~1700-2000
+ticks, peak ~80%) using information (`troop_ratio`) now actually in the
+observation. `50%` was chosen deliberately past the engine's actual troop-production
+optimum: `Config.ts`'s `troopIncreaseRate()` is `(10 + troops^0.73/4) *
+(1 - troops/max)`, which maximizes analytically at `ratio = 0.73/1.73 ≈ 0.422`
+(42.2%) - banking a bit past peak production rate before striking.
+
+**Deliberately not adding a reward term for patience/troop accumulation.** Tempting
+given the diagnostic above, but risky: a shaped reward that directly rewards
+"waiting" or "high troop ratio" would teach a fixed habit, not a conditional
+strategy - and patience isn't universally correct (a weak/exposed opponent should be
+hit immediately, not given time to recover). That's the same class of failure as the
+original always-attack policy, just inverted. The principled fix is what already
+landed above: give the network the observation it needs to *condition* the decision
+(`troop_ratio`, opponent type/strength via the entity encoder) and let the existing
+outcome-based reward (tile fraction + win/loss) teach it when each strategy applies.
+The patient-heuristic result is a ceiling to validate against, not a target
+behavior to bake into the reward function. If credit assignment is still too weak
+to learn this after the fixes above, the principled fallback is potential-based
+reward shaping (Ng et al. 1999) - provably policy-invariant, unlike an ad hoc
+patience bonus - not yet implemented.
+
 **Throughput — async actor/learner overlap (IMPALA-style), likely bigger than more
 `NUM_ENVS` tuning.** Rollout and PPO currently run strictly sequentially within one
 update (`time=64s (rollout=38s ppo=26s)` at `NUM_ENVS=16`) — the GPU is fully idle
@@ -336,10 +409,20 @@ table:
   is for a 5.3M-param network.
 - Bigger `MINIBATCH_SIZE` (GPU util is ~60% at the current 256) — fewer, larger
   minibatches amortize per-call overhead better.
-- Vectorize the per-env Python loop in `run_update()` (currently a plain
-  `for k in range(n):` doing numpy work one env at a time under the GIL) — doesn't
-  change the parallelism ceiling found in the benchmark, but lowers the constant
-  per-tick cost, raising the whole throughput curve rather than shifting the plateau.
+- ~~Vectorize the per-env Python loop~~ **Done, real cause was sharper than
+  suspected.** An overnight run bumped `NUM_ENVS` 24→32 expecting more throughput.
+  Instead `ticks/sec` was identical (~550) at both 8 and 32 envs — zero parallelism
+  benefit, rollout wall time scaling exactly linearly with env count. Cause:
+  `encode_observation()` recomputed the full `(H,W)` `is_mine`/`is_enemy` planes from
+  `owner_grid` every tick, per env, in the serial `for k in range(n):` loop — even
+  though `apply_tile_updates` already knows exactly which tiles changed that tick.
+  Fixed by maintaining `is_mine`/`is_enemy` incrementally inside `apply_tile_updates`
+  (update only the changed indices), threaded through `EpisodeState` and
+  `encode_observation`'s new signature. Verified bit-exact against the old full
+  recompute over 400 real ticks before trusting it. Re-benchmarked `run_update()`
+  itself post-fix (5 timed updates/config): `NUM_ENVS` 16→866, 20→906, **24→925
+  (best)**, 28→919 (statistically tied with 24, higher variance), 32→629 (cliff —
+  16-core machine oversubscribed 2x). `NUM_ENVS` set to 24.
 
 **Multi-horizon value heads** (idea, unimplemented): a second value head at a much
 higher `GAMMA`, computed via a second GAE backward pass over the same rollout data.
@@ -355,6 +438,16 @@ become orphaned and keep running (and keep burning GPU/CPU) alongside a freshly
 started run. Kill the full process group (`ps aux | grep -E "python -m
 training.models.train|node.*dist/server.mjs"`, kill all matching PIDs) before
 relaunching, not just the main PID.
+
+**Another one: stdout buffering when logging to a file.** `train.py`'s prints are
+plain `print()`, no `flush=True`. Redirected to a file (`> log.txt`, not a TTY),
+Python fully buffers stdout - each `update` line is ~220 bytes, default buffer is
+~8KB, so ~35+ updates queue up before anything actually appears on disk. Looks
+exactly like a hang (a live process, growing CPU/GPU use, an empty-looking log) but
+isn't one - the Node subprocesses' own stdout (game-end messages) is a separate,
+unbuffered fd and shows up immediately, which is a useful tell: log growing on game
+events but silent on `update` lines means it's buffering, not stuck. Launch with
+`python -u -m training.models.train` (or `PYTHONUNBUFFERED=1`) to see progress live.
 
 ## Licensing note
 

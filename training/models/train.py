@@ -8,34 +8,57 @@ import numpy as np
 import torch.optim
 
 from training.envs.vec_bridge import VecOpenFrontBridge
-from training.envs.game_state import apply_tile_updates, apply_player_updates
+from training.envs.game_state import apply_tile_updates, apply_player_updates, apply_max_troops, apply_land_bitmap
 from training.envs.observation import encode_observation
 from training.envs.action_space import build_entities, pad_entities, action_to_intents, DO_NOTHING
 from training.envs.reward import compute_reward
+from training.envs.running_stats import RunningMeanStd
 from training.models.policy import Agent
 
-STEPS = 2000
-NUM_UPDATES = 720  # ~8h overnight budget at the ~40s/update observed rate
+
+# 2000 undershoots mid_plains: measured avg episode length across a full run sat at
+# ~2100-2150 ticks the whole time, meaning a chunk of episodes straddled the rollout
+# boundary and never gave GAE their real terminal win/loss reward within one update.
+STEPS = 3000
+NUM_UPDATES = 720
 NUM_ENVS = 24
 
-# Curriculum: start with one Nation opponent; if it's winning nearly every
-# game (not us, not a Tribe), the FFA field is too easy to dominate for it -
-# bump to a full nation pool so nations spend more of the game fighting each
-# other instead of just steamrolling the agent. One-shot (curriculum_done
-# latches) so it doesn't oscillate once bumped.
+# Tried bots=1,nations=0 briefly (single weak Tribe) to unstick a value function that
+# only tracked tick number, not state (see the value-trace diagnostic: corr(V,tick)
+# ~ -0.95 to -0.98, corr(V,troop_ratio) weak and sign-flipped, ~97% losses vs. a
+# Nation). It did produce real wins immediately (4/8 at update 0) - but reverted back
+# to nations=1: a Tribe barely fights back, so the existing greedy-spam-attack habit
+# already wins there, meaning PPO would reinforce spamming as "correct" rather than
+# push toward the patience that's actually needed against real competition. Back to
+# bots=0,nations=1 (pure 1v1 vs. a strong Nation).
+BOTS = 0
 NATIONS = 1
+# never set explicitly before now - bridge.reset()/harness.ts silently defaulted to
+# Easy the whole time. Setting it explicitly so it can't silently drift (same class
+# of bug as watch.py's stale hardcoded bots=3,nations=1 found earlier this session).
+DIFFICULTY = "Easy"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
-CHECKPOINT_INTERVAL = 50
+CHECKPOINT_INTERVAL = 32
 CHECKPOINT_KEEP = 5
 
 
-def save_checkpoint(agent, update: int) -> Path:
+def save_checkpoint(agent, update: int, gold_stats: RunningMeanStd) -> Path:
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     path = CHECKPOINT_DIR / f"agent_{time.strftime('%Y%m%d_%H%M%S')}_update{update}.pt"
-    torch.save(agent.state_dict(), path)
+    # gold_stats travels with the weights - watch.py or a resumed run need the exact
+    # same normalization the weights were trained against, not a freshly-reset one.
+    torch.save(
+        {
+            "model": agent.state_dict(),
+            "gold_mean": gold_stats.mean,
+            "gold_var": gold_stats.var,
+            "gold_count": gold_stats.count,
+        },
+        path,
+    )
 
     checkpoints = sorted(CHECKPOINT_DIR.glob("agent_*.pt"))
     for stale in checkpoints[:-CHECKPOINT_KEEP]:
@@ -49,7 +72,7 @@ def latest_checkpoint() -> Path | None:
     return checkpoints[-1] if checkpoints else None
 
 LR = 1e-4
-GAMMA = 0.9995
+GAMMA = 0.999667  # horizon = STEPS = 3000
 GAE_LAMBDA = 0.95
 PPO_EPOCHS = 4
 MINIBATCH_SIZE = 256
@@ -63,6 +86,8 @@ class EpisodeState:
     height: int
     owner_grid: np.ndarray
     land_mask: np.ndarray
+    is_mine: np.ndarray
+    is_enemy: np.ndarray
     player_stats: dict
     agent_client_id: str
     agent_small_id: int
@@ -75,19 +100,42 @@ class EpisodeState:
     targets: list
 
 
-def _episode_state_from_setup(setup: dict) -> EpisodeState:
+def _apply_gold_stats(scalar: np.ndarray, entity_features: np.ndarray, gold_stats: RunningMeanStd) -> None:
+    """Update the running gold estimate from real observations only (wilderness/
+    do-nothing rows carry a fixed 0.0 placeholder in the gold column, not a real
+    reading, so they'd bias the mean if included), then normalize gold in-place
+    everywhere it appears - the agent's own scalar and every entity's gold feature,
+    placeholders included (they get the same affine shift, which is fine since the
+    type one-hot already tells the network whether a row is real).
+    """
+    is_real = (entity_features[:, 0] == 1.0) | (entity_features[:, 1] == 1.0)  # is_tribe or is_nation
+    real_gold = entity_features[is_real, 5]
+    own_gold = scalar[0:1]
+    gold_stats.update(np.concatenate([own_gold, real_gold]) if real_gold.size else own_gold)
+
+    scalar[0] = gold_stats.normalize(scalar[0])
+    entity_features[:, 5] = gold_stats.normalize(entity_features[:, 5])
+
+
+def _episode_state_from_setup(setup: dict, gold_stats: RunningMeanStd) -> EpisodeState:
     width, height = setup["width"], setup["height"]
 
     owner_grid = np.zeros((height, width), dtype=np.uint32)
     land_mask = np.zeros((height, width), dtype=bool)
+    is_mine = np.zeros((height, width), dtype=bool)
+    is_enemy = np.zeros((height, width), dtype=bool)
     player_stats = {}
-    apply_tile_updates(owner_grid, land_mask, width, setup["packedTileUpdates"])
-    apply_player_updates(player_stats, setup["packedPlayerUpdates"])
-
     agent_small_id = setup["agentSmallID"]
+    apply_tile_updates(owner_grid, land_mask, width, setup["packedTileUpdates"], agent_small_id, is_mine, is_enemy)
+    apply_land_bitmap(land_mask, width, setup["landBitmap"])
+    apply_player_updates(player_stats, setup["packedPlayerUpdates"])
+    apply_max_troops(player_stats, setup["maxTroops"])
+
     player_types = {int(sid): t for sid, t in setup["playerTypes"].items()}
-    spatial, scalar = encode_observation(owner_grid, land_mask, player_stats, agent_small_id)
-    entity_features, targets = build_entities([], player_stats, player_types, land_mask.sum())
+    total_land = setup["totalLand"]
+    spatial, scalar = encode_observation(land_mask, is_mine, is_enemy, player_stats, agent_small_id, total_land)
+    entity_features, targets = build_entities([], player_stats, player_types, total_land)
+    _apply_gold_stats(scalar, entity_features, gold_stats)
     entities, entity_mask = pad_entities(entity_features)
 
     return EpisodeState(
@@ -95,6 +143,8 @@ def _episode_state_from_setup(setup: dict) -> EpisodeState:
         height=height,
         owner_grid=owner_grid,
         land_mask=land_mask,
+        is_mine=is_mine,
+        is_enemy=is_enemy,
         player_stats=player_stats,
         agent_client_id=setup["agentClientID"],
         agent_small_id=agent_small_id,
@@ -108,25 +158,31 @@ def _episode_state_from_setup(setup: dict) -> EpisodeState:
     )
 
 
-def start_episode(bridge) -> EpisodeState:
+def start_episode(bridge, gold_stats: RunningMeanStd) -> EpisodeState:
     """Used for standalone scripts and per-slot resets in run_update."""
     setup = bridge.reset(
         seed=str(random.randint(0, 2 ** 31 - 1)),
         map="mid_plains",
-        bots=0,
-        nations=NATIONS
+        bots=BOTS,
+        nations=NATIONS,
+        difficulty=DIFFICULTY,
     )
-    return _episode_state_from_setup(setup)
+    return _episode_state_from_setup(setup, gold_stats)
 
 
-def start_all_episodes(vec_bridge: VecOpenFrontBridge) -> list[EpisodeState]:
+def start_all_episodes(vec_bridge: VecOpenFrontBridge, gold_stats: RunningMeanStd) -> list[EpisodeState]:
     """Each slot needs its own random seed - sharing one would clone the same
     deterministic game across every env."""
-    return list(vec_bridge.executor.map(start_episode, vec_bridge.bridges))
+    return list(vec_bridge.executor.map(lambda b: start_episode(b, gold_stats), vec_bridge.bridges))
 
 
 def run_update(
-    vec_bridge: VecOpenFrontBridge, agent, optimizer, episodes: list[EpisodeState], update: int
+    vec_bridge: VecOpenFrontBridge,
+    agent,
+    optimizer,
+    episodes: list[EpisodeState],
+    update: int,
+    gold_stats: RunningMeanStd,
 ) -> tuple[list[EpisodeState], int, int]:
     """One STEPS-length rollout across all NUM_ENVS envs, GAE per env, one PPO
     update over the flattened STEPS*NUM_ENVS batch. Rollout buffers stay on
@@ -197,7 +253,11 @@ def run_update(
             values[i, k] = values_np[k]
 
             apply_player_updates(episode.player_stats, player_updates)
-            apply_tile_updates(episode.owner_grid, episode.land_mask, episode.width, tile_updates)
+            apply_max_troops(episode.player_stats, step_result["maxTroops"])
+            apply_tile_updates(
+                episode.owner_grid, episode.land_mask, episode.width, tile_updates,
+                episode.agent_small_id, episode.is_mine, episode.is_enemy
+            )
 
             curr_stats = episode.player_stats.get(episode.agent_small_id, {})
             # the wider FFA game runs long after our agent is wiped out, so elimination
@@ -208,15 +268,18 @@ def run_update(
             won = (not eliminated) and step_result["winner"] == episode.agent_name
             wins[i, k] = won
 
-            reward = compute_reward(prev_stats, curr_stats, done, won, episode.land_mask.sum())
+            total_land = step_result["totalLand"]
+            reward = compute_reward(prev_stats, curr_stats, done, won, total_land, GAMMA)
             rewards[i, k] = reward
 
             episode.spatial, episode.scalar = encode_observation(
-                episode.owner_grid, episode.land_mask, episode.player_stats, episode.agent_small_id
+                episode.land_mask, episode.is_mine, episode.is_enemy, episode.player_stats,
+                episode.agent_small_id, total_land
             )
             entity_features, episode.targets = build_entities(
-                attack_mask, episode.player_stats, episode.player_types, episode.land_mask.sum()
+                attack_mask, episode.player_stats, episode.player_types, total_land
             )
+            _apply_gold_stats(episode.scalar, entity_features, gold_stats)
             episode.entities, episode.entity_mask = pad_entities(entity_features)
 
             # reset just this slot - the others keep ticking independently
@@ -224,7 +287,7 @@ def run_update(
                 # gold at the moment a game ends - the action space has no way to
                 # spend it yet, so this tracks how much is piling up unused
                 episode_end_golds.append(curr_stats.get("gold", 0.0))
-                episodes[k] = start_episode(vec_bridge.bridges[k])
+                episodes[k] = start_episode(vec_bridge.bridges[k], gold_stats)
 
     with torch.no_grad():
         last_spatial = np.stack([e.spatial for e in episodes])
@@ -357,14 +420,32 @@ def run_update(
 
 
 def train():
+    gold_stats = RunningMeanStd()
+    # Load (but don't apply to an agent yet) before building any episodes - the
+    # first observations need to be normalized with the resumed stats, not a fresh
+    # RunningMeanStd(), or a resumed run's initial states are miscalibrated relative
+    # to the weights that are about to be loaded into the same agent.
+    checkpoint_path = latest_checkpoint()
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE) if checkpoint_path is not None else None
+    if checkpoint is not None:
+        gold_stats.mean = checkpoint["gold_mean"]
+        gold_stats.var = checkpoint["gold_var"]
+        gold_stats.count = checkpoint["gold_count"]
+
     with VecOpenFrontBridge(NUM_ENVS) as vec_bridge:
-        episodes = start_all_episodes(vec_bridge)
+        episodes = start_all_episodes(vec_bridge, gold_stats)
 
         agent = Agent.from_observation(episodes[0].spatial, episodes[0].scalar, episodes[0].entities).to(DEVICE)
-        checkpoint = latest_checkpoint()
         if checkpoint is not None:
-            agent.load_state_dict(torch.load(checkpoint, map_location=DEVICE))
-            print(f"resumed from {checkpoint}")
+            # strict=False so an architecture change (e.g. adding gate_head) warm-starts
+            # from whatever weights still match - backbone/entity encoder/value_head/
+            # query_proj carry over, only the genuinely new layers start randomly
+            # initialized, instead of throwing away everything already learned.
+            missing, unexpected = agent.load_state_dict(checkpoint["model"], strict=False)
+            if missing or unexpected:
+                print(f"partial resume from {checkpoint_path}: missing={missing} unexpected={unexpected}")
+            else:
+                print(f"resumed from {checkpoint_path}")
         optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
         print(f"training on device={DEVICE}, num_envs={NUM_ENVS}")
 
@@ -372,14 +453,16 @@ def train():
         total_wins = 0
 
         for update in range(NUM_UPDATES):
-            episodes, episodes_finished, episode_wins = run_update(vec_bridge, agent, optimizer, episodes, update)
+            episodes, episodes_finished, episode_wins = run_update(
+                vec_bridge, agent, optimizer, episodes, update, gold_stats
+            )
             total_episodes += episodes_finished
             total_wins += episode_wins
 
-            if update % CHECKPOINT_INTERVAL == 0:
-                save_checkpoint(agent, update)
+            if update != 0 and update % CHECKPOINT_INTERVAL == 0:
+                save_checkpoint(agent, update, gold_stats)
 
-        save_checkpoint(agent, NUM_UPDATES)
+        save_checkpoint(agent, NUM_UPDATES, gold_stats)
 
         win_rate = total_wins / total_episodes if total_episodes > 0 else 0.0
         print(

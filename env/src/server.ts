@@ -30,6 +30,39 @@ function winnerSmallID(winner: Player | Team | null): number | null {
   return winner.smallID();
 }
 
+// Troop capacity scales with population/tiles owned (and difficulty for bots) and
+// changes over the game - the scripted AI itself gates on troops()/maxTroops() as a
+// ratio (AiAttackBehavior.ts's hasReserveRatioTroops), not raw troop count, so this
+// needs to travel every tick, not just at reset.
+function maxTroopsBySmallID(session: HarnessSession): Record<number, number> {
+  const config = session.game.config();
+  return Object.fromEntries(
+    session.game.players().map((p) => [p.smallID(), config.maxTroops(p)]),
+  );
+}
+
+// The engine's own authoritative land-tile count (matches WinCheckExecution's win-
+// condition denominator exactly) - cheap field reads, safe to send every tick.
+function totalLand(session: HarnessSession): number {
+  const map = session.game.map();
+  return map.numLandTiles() - map.numTilesWithFallout();
+}
+
+// packedTileUpdates only ever covers tiles whose owner/water/fallout state has
+// changed at least once (see GameImpl.recordTileUpdate's call sites) - it is not a
+// full terrain dump. Without this, a client reconstructing land_mask purely from
+// that delta stream starts near-empty and only fills in as territory gets fought
+// over, badly undercounting total land for most of a game. Sent once at reset;
+// the normal tile-update stream keeps it in sync with any later water conversions.
+function landBitmap(session: HarnessSession): Uint8Array {
+  const map = session.game.map();
+  const bitmap = new Uint8Array(map.width() * map.height());
+  for (let ref = 0; ref < bitmap.length; ref++) {
+    bitmap[ref] = map.isLand(ref) ? 1 : 0;
+  }
+  return bitmap;
+}
+
 function toBase64(
   arr: { buffer: ArrayBufferLike; byteOffset: number; byteLength: number } | undefined,
 ): string | null {
@@ -72,6 +105,9 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       packedPlayerUpdates: toBase64(session.state.packedPlayerUpdates),
       unitUpdates: session.state.unitUpdates,
       playerTypes: Object.fromEntries(session.game.players().map((p) => [p.smallID(), p.type()])),
+      maxTroops: maxTroopsBySmallID(session),
+      landBitmap: toBase64(landBitmap(session)),
+      totalLand: totalLand(session),
     });
     return;
   }
@@ -96,6 +132,8 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       packedPlayerUpdates: toBase64(result.packedPlayerUpdates),
       attackMask: result.attackMask,
       unitUpdates: result.unitUpdates,
+      maxTroops: maxTroopsBySmallID(session),
+      totalLand: totalLand(session),
     });
     return;
   }

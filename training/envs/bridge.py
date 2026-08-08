@@ -16,6 +16,7 @@ def _decode(b64_str: str | None, dtype) -> np.ndarray | None:
 def _decode_packed(res: dict) -> dict:
     res["packedTileUpdates"] = _decode(res.get("packedTileUpdates"), np.uint32)
     res["packedPlayerUpdates"] = _decode(res.get("packedPlayerUpdates"), np.float64)
+    res["landBitmap"] = _decode(res.get("landBitmap"), np.uint8)
     return res
 
 _built = False

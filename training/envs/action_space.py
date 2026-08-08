@@ -11,7 +11,7 @@ path handles every candidate uniformly.
 
 import numpy as np
 
-# [is_tribe, is_nation, is_wilderness, is_do_nothing, tile_fraction, log_gold, log_troops]
+# [is_tribe, is_nation, is_wilderness, is_do_nothing, tile_fraction, log_gold, troop_ratio]
 ENTITY_FEATURES = 7
 
 # Buffer-size cap, not a meaningful-identity cap like the old ATTACK_SLOTS - truncation
@@ -43,6 +43,8 @@ def build_entities(
         if c["targetID"] is not None:
             stats = player_stats.get(c["smallID"], {})
             ptype = player_types.get(c["smallID"], "BOT")
+            # ratio, not raw count - see observation.py's encode_observation for why
+            troop_ratio = stats.get("troops", 0.0) / max(stats.get("maxTroops", 1.0), 1)
             rows.append([
                 float(ptype == "BOT"),
                 float(ptype == "NATION"),
@@ -50,7 +52,7 @@ def build_entities(
                 0.0,
                 stats.get("tilesOwned", 0.0) / max(total_land, 1),
                 float(np.log1p(stats.get("gold", 0.0))),
-                float(np.log1p(stats.get("troops", 0.0))),
+                troop_ratio,
             ])
             targets.append(c["targetID"])
         else:

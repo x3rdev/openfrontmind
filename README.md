@@ -159,17 +159,50 @@ Value-loss clipping added (mirroring the existing policy-ratio clip — motivate
 directly observing the value loss sawtooth on every episode completion in a real
 run). Training map upgraded after discovering the original map was roughly two
 orders of magnitude smaller than a typical real game, dense enough that even a
-perfect heuristic couldn't reliably win it. The entity-encoder rewrite is built,
-verified end-to-end through the real training and playback CLIs, and not yet
-re-evaluated at scale — that comparison (trained policy vs. the dumb baseline, again)
-is the next milestone.
+perfect heuristic couldn't reliably win it.
+
+### Phase 10 — Entity encoder re-tested: still stuck
+
+Re-ran the dumb-policy comparison against the entity-encoder architecture (500
+updates). Same result as before the rewrite: peak tile share and timing matched the
+non-learning heuristic almost exactly, every game lost to the same opponent. The
+slot-identity bug was real and worth fixing, but it wasn't the whole story.
+
+### Phase 11 — The value function was learning tick number, not board state
+
+Traced `V(s)` tick-by-tick through a real game: declined smoothly for the whole
+episode, including the first 140 ticks while tile share was still climbing. A value
+function tracking "expected return at this point in time" instead of "given this
+board state" breaks PPO's advantage estimate no matter how good the policy is.
+Cause: the observation only ever exposed raw troop count, which grows with elapsed
+time regardless of strategy — an easy shortcut for a value function to latch onto.
+Fixed: added `troops/maxTroops` ratio (what the game's own scripted AI actually
+gates attacks on) to both the agent's scalar observation and each entity's features.
+
+### Phase 12 — Patience beats greed, proven outside the network
+
+Built a second hardcoded heuristic — wait until troop ratio crosses 50%, then attack
+— against the original always-attack heuristic, 6 identical seeds, zero learning
+either way. Patient: 6/6 wins. Greedy: 6/6 losses. Disproved the "the action space
+needs buildings" theory, and handed the trained policy a concrete ceiling to hold
+itself against (~80% peak tile share, 100% win rate) using a signal it can now see.
+
+### Phase 13 — Rollout throughput was flat, not just slow
+
+Bumping `NUM_ENVS` 24→32 for an overnight run didn't help: `ticks/sec` was identical
+(~550) at 8 envs and at 32 — zero parallelism benefit. Cause: `encode_observation()`
+recomputed the full spatial planes from scratch every tick, per env, in a serialized
+loop, instead of updating only the tiles that changed. Fixed by maintaining those
+planes incrementally; verified bit-exact against the old computation over 400 real
+ticks. Re-benchmarked: real scaling now shows up to `NUM_ENVS=24` (925 ticks/sec),
+with a hard falloff by 32 (629 — a 16-core machine oversubscribed 2x). `NUM_ENVS`
+set to 24.
 
 ## What's next
 
-- Re-run the dumb-policy comparison against the entity-encoder architecture — the
-  test that caught the original bug is also the test that validates the fix.
-- Observation/reward normalization via running statistics.
-- Async actor/learner overlap for throughput.
+- A real training run at the fixed throughput + entity-encoder + troop-ratio
+  observation, to see if the stuck-learning symptom is actually resolved.
+- Async actor/learner overlap for throughput (bigger lever than env count).
 - Buildings and economy actions, once the agent can reliably survive long enough to
   spend the gold it hoards (currently ~135K per game, unspent, in an attack-only
   action space).
