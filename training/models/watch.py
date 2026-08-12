@@ -18,6 +18,7 @@ def main(
     log_probs: bool = False, prob_log_interval: int = 1,
     log_value: bool = False, value_log_interval: int = 1,
     bots: int = BOTS, nations: int = NATIONS, difficulty: str = DIFFICULTY,
+    max_ticks: int | None = None,
 ) -> dict | None:
     print(f"using checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path)
@@ -32,6 +33,7 @@ def main(
         setup = bridge.reset(seed=seed, map="mid_plains", bots=bots, nations=nations, difficulty=difficulty)
         agent_client_id = setup["agentClientID"]
         agent_small_id = setup["agentSmallID"]
+        agent_name = setup["agentName"]
         player_types = {int(sid): t for sid, t in setup["playerTypes"].items()}
         width, height = setup["width"], setup["height"]
 
@@ -83,9 +85,10 @@ def main(
         # answers "does p(wait) actually track troop_ratio, or is it flat/dilution-bound".
         prob_samples = []
 
-        # (tick, value, troop_ratio, tile_fraction) - answers "is V(s) state-aware, or
-        # is it just fitting a smooth curve against elapsed tick number" (see CLAUDE.md's
-        # earlier value-trace finding, from before troop_ratio was in the observation).
+        # (tick, value, troop_ratio, tile_fraction, incoming_ratio) - answers "is V(s)
+        # state-aware, or is it just fitting a smooth curve against elapsed tick number"
+        # (see CLAUDE.md's earlier value-trace finding, from before troop_ratio was in
+        # the observation). incoming_ratio added alongside outgoing/incoming troops.
         value_samples = []
 
         for i in range(int(1.0e100)):
@@ -119,21 +122,32 @@ def main(
                 if i % prob_log_interval == 0:
                     chosen = "do_nothing" if target is DO_NOTHING else "attack"
                     p_str = "n/a(truncated)" if p_do_nothing is None else f"{p_do_nothing:.3f}"
+                    # what's actually being attacked - is_tribe/is_nation/is_wilderness,
+                    # tile_fraction, troop_ratio (see ENTITY_FEATURES order in action_space.py)
+                    target_str = ""
+                    if target is not DO_NOTHING and action_idx < len(entity_features):
+                        row = entity_features[action_idx]
+                        kind = "tribe" if row[0] else "nation" if row[1] else "wilderness" if row[2] else "?"
+                        target_str = (
+                            f" target_kind={kind} target_tile_fraction={row[4]:.3f} "
+                            f"target_troop_ratio={row[6]:.3f} target_attacking_me_ratio={row[7]:.3f}"
+                        )
                     print(
                         f"[prob] tick={i} troop_ratio={troop_ratio_now:.3f} n_candidates={n_candidates} "
                         f"p_do_nothing={p_str} p_attack={'n/a' if p_do_nothing is None else f'{1 - p_do_nothing:.3f}'} "
-                        f"chosen={chosen}"
+                        f"chosen={chosen}{target_str}"
                     )
 
             if log_value:
                 value_now = value.item()
                 troop_ratio_now = float(scalar[1])
                 tile_fraction_now = float(scalar[2])
-                value_samples.append((i, value_now, troop_ratio_now, tile_fraction_now))
+                incoming_ratio_now = float(scalar[4])
+                value_samples.append((i, value_now, troop_ratio_now, tile_fraction_now, incoming_ratio_now))
                 if i % value_log_interval == 0:
                     print(
                         f"[value] tick={i} V={value_now:.3f} troop_ratio={troop_ratio_now:.3f} "
-                        f"tile_fraction={tile_fraction_now:.3f}"
+                        f"tile_fraction={tile_fraction_now:.3f} incoming_ratio={incoming_ratio_now:.3f}"
                     )
 
             if diagnostic:
@@ -170,7 +184,10 @@ def main(
             eliminated = player_stats.get(agent_small_id, {}).get("tilesOwned", 0.0) == 0.0
 
             total_land = step_result["totalLand"]
-            spatial, scalar = encode_observation(land_mask, is_mine, is_enemy, player_stats, agent_small_id, total_land)
+            spatial, scalar = encode_observation(
+                land_mask, is_mine, is_enemy, player_stats, agent_small_id, total_land,
+                step_result["outgoingTroops"], step_result["incomingTroops"],
+            )
             entity_features, targets = build_entities(attack_mask, player_stats, player_types, total_land)
             scalar[0] = gold_stats.normalize(scalar[0])
             entity_features[:, 5] = gold_stats.normalize(entity_features[:, 5])
@@ -192,19 +209,25 @@ def main(
                 print("game over, winner:", step_result["winner"])
                 break
 
+            if max_ticks is not None and i >= max_ticks:
+                print(f"stopped early at max_ticks={max_ticks}")
+                step_result["winner"] = None
+                break
+
         if not headless:
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
         if log_value and len(value_samples) > 1:
-            ticks, values, ratios, tile_fracs = (np.array(x) for x in zip(*value_samples))
+            ticks, values, ratios, tile_fracs, incoming_ratios = (np.array(x) for x in zip(*value_samples))
             corr_tick = np.corrcoef(ticks, values)[0, 1]
             corr_ratio = np.corrcoef(ratios, values)[0, 1]
             corr_tile = np.corrcoef(tile_fracs, values)[0, 1]
+            corr_incoming = np.corrcoef(incoming_ratios, values)[0, 1] if incoming_ratios.std() > 0 else float("nan")
             print(
                 f"[value-summary] seed={seed} n={len(value_samples)} "
                 f"corr(V,tick)={corr_tick:.3f} corr(V,troop_ratio)={corr_ratio:.3f} "
-                f"corr(V,tile_fraction)={corr_tile:.3f}"
+                f"corr(V,tile_fraction)={corr_tile:.3f} corr(V,incoming_ratio)={corr_incoming:.3f}"
             )
 
         if log_probs and prob_samples:
@@ -225,7 +248,7 @@ def main(
                 "seed": seed,
                 "final_tick": i,
                 "winner": step_result["winner"],
-                "won": step_result["winner"] == agent_client_id,
+                "won": step_result["winner"] == agent_name,
                 "do_nothing_ticks": do_nothing_ticks,
                 "attack_ticks": attack_ticks,
                 "first_attack_tick": first_attack_tick,
@@ -262,6 +285,7 @@ if __name__ == "__main__":
     parser.add_argument("--bots", type=int, default=BOTS, help=f"defaults to train.py's current BOTS ({BOTS}) - keep in sync with what the checkpoint was actually trained against")
     parser.add_argument("--nations", type=int, default=NATIONS, help=f"defaults to train.py's current NATIONS ({NATIONS})")
     parser.add_argument("--difficulty", default=DIFFICULTY, help=f"defaults to train.py's current DIFFICULTY ({DIFFICULTY})")
+    parser.add_argument("--max-ticks", type=int, default=None, help="stop early after N ticks - for fast cross-checkpoint probing instead of playing out a full game")
     args = parser.parse_args()
 
     checkpoint_path = args.checkpoint or latest_checkpoint()
@@ -277,6 +301,7 @@ if __name__ == "__main__":
             log_probs=args.log_probs, prob_log_interval=args.prob_log_interval,
             log_value=args.log_value, value_log_interval=args.value_log_interval,
             bots=args.bots, nations=args.nations, difficulty=args.difficulty,
+            max_ticks=args.max_ticks,
         ))
 
     if args.diagnostic and len(seeds) > 1:

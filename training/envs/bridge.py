@@ -93,5 +93,13 @@ class OpenFrontBridge:
         self.process.stdin.write(json.dumps(cmd) + "\n")
         self.process.stdin.flush()
         line = self.process.stdout.readline()
-        return json.loads(line.removeprefix("OFM:"))
+        res = json.loads(line.removeprefix("OFM:"))
+        # server.ts catches any exception from handle() and replies with
+        # cmd_success=False instead of the normal response shape - without this
+        # check that error message is silently dropped and a caller indexing a
+        # missing field (e.g. step_result["attackMask"]) sees an opaque KeyError
+        # with no indication anything went wrong server-side.
+        if not res.get("cmd_success", True):
+            raise RuntimeError(f"env server error on {cmd['cmd']}: {res.get('error')}\n{res.get('stack', '')}")
+        return res
 

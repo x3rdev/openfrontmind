@@ -11,8 +11,9 @@ path handles every candidate uniformly.
 
 import numpy as np
 
-# [is_tribe, is_nation, is_wilderness, is_do_nothing, tile_fraction, log_gold, troop_ratio]
-ENTITY_FEATURES = 7
+# [is_tribe, is_nation, is_wilderness, is_do_nothing, tile_fraction, log_gold, troop_ratio,
+#  attacking_me_ratio]
+ENTITY_FEATURES = 8
 
 # Buffer-size cap, not a meaningful-identity cap like the old ATTACK_SLOTS - truncation
 # just means "ignore the least-relevant excess candidates this one tick," not "this
@@ -43,8 +44,13 @@ def build_entities(
         if c["targetID"] is not None:
             stats = player_stats.get(c["smallID"], {})
             ptype = player_types.get(c["smallID"], "BOT")
+            max_troops = max(stats.get("maxTroops", 1.0), 1)
             # ratio, not raw count - see observation.py's encode_observation for why
-            troop_ratio = stats.get("troops", 0.0) / max(stats.get("maxTroops", 1.0), 1)
+            troop_ratio = stats.get("troops", 0.0) / max_troops
+            # fraction of *this candidate's* own army currently committed to attacking
+            # the agent - lets the network see which nearby player is actually hostile
+            # right now, not just whether the agent could attack them back.
+            attacking_me_ratio = c["attackingMeTroops"] / max_troops
             rows.append([
                 float(ptype == "BOT"),
                 float(ptype == "NATION"),
@@ -53,13 +59,14 @@ def build_entities(
                 stats.get("tilesOwned", 0.0) / max(total_land, 1),
                 float(np.log1p(stats.get("gold", 0.0))),
                 troop_ratio,
+                attacking_me_ratio,
             ])
             targets.append(c["targetID"])
         else:
-            rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+            rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             targets.append(None)
 
-    rows.append([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    rows.append([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
     targets.append(DO_NOTHING)
 
     return np.array(rows, dtype=np.float32), targets

@@ -21,7 +21,7 @@ from training.models.policy import Agent
 # boundary and never gave GAE their real terminal win/loss reward within one update.
 STEPS = 3000
 NUM_UPDATES = 720
-NUM_ENVS = 24
+NUM_ENVS = 16
 
 # Tried bots=1,nations=0 briefly (single weak Tribe) to unstick a value function that
 # only tracked tick number, not state (see the value-trace diagnostic: corr(V,tick)
@@ -29,10 +29,26 @@ NUM_ENVS = 24
 # Nation). It did produce real wins immediately (4/8 at update 0) - but reverted back
 # to nations=1: a Tribe barely fights back, so the existing greedy-spam-attack habit
 # already wins there, meaning PPO would reinforce spamming as "correct" rather than
-# push toward the patience that's actually needed against real competition. Back to
-# bots=0,nations=1 (pure 1v1 vs. a strong Nation).
+# push toward the patience that's actually needed against real competition.
+#
+# Tried sampling difficulty (Easy/Medium/Hard) per episode next, to fix the same
+# low-outcome-diversity problem without the bots=1 trap - reverted after a direct
+# before/after diagnostic on the same checkpoint showed it moved the wrong way:
+# mean_attack_troop_ratio dropped (0.016->0.010), p(do_nothing) at low troop_ratio
+# dropped (0.72->0.57), peak_tile_fraction dropped (0.53->0.48). The network has no
+# way to perceive which difficulty tier is active, so the harder tiers' pressure to
+# act before a fast-scaling opponent grows out of reach seems to have dragged the
+# whole policy toward more aggression on average, not less.
+#
+# Now trying nations=10 (still fixed Easy) instead - a bigger lobby rather than a
+# stronger single opponent. Known risk from an earlier dumb-policy diagnostic this
+# session: more competing players caps the achievable tile-share ceiling and raises
+# elimination risk independent of learning (bots=9,nations=0 -> peak 26-28%, 3/3
+# full elimination even with zero learning involved). Worth watching for that same
+# ceiling-capping effect showing up here before reading too much into any win-rate
+# change.
 BOTS = 0
-NATIONS = 1
+NATIONS = 10
 # never set explicitly before now - bridge.reset()/harness.ts silently defaulted to
 # Easy the whole time. Setting it explicitly so it can't silently drift (same class
 # of bug as watch.py's stale hardcoded bots=3,nations=1 found earlier this session).
@@ -42,10 +58,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
 CHECKPOINT_INTERVAL = 32
-CHECKPOINT_KEEP = 5
+CHECKPOINT_KEEP = 10
 
 
-def save_checkpoint(agent, update: int, gold_stats: RunningMeanStd) -> Path:
+def save_checkpoint(agent, update: int, gold_stats: RunningMeanStd, total_train_hours: float) -> Path:
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     path = CHECKPOINT_DIR / f"agent_{time.strftime('%Y%m%d_%H%M%S')}_update{update}.pt"
     # gold_stats travels with the weights - watch.py or a resumed run need the exact
@@ -56,6 +72,7 @@ def save_checkpoint(agent, update: int, gold_stats: RunningMeanStd) -> Path:
             "gold_mean": gold_stats.mean,
             "gold_var": gold_stats.var,
             "gold_count": gold_stats.count,
+            "total_train_hours": total_train_hours,
         },
         path,
     )
@@ -75,7 +92,7 @@ LR = 1e-4
 GAMMA = 0.999667  # horizon = STEPS = 3000
 GAE_LAMBDA = 0.95
 PPO_EPOCHS = 4
-MINIBATCH_SIZE = 256
+MINIBATCH_SIZE = 1024  # was 256, GPU util sat ~60% there
 CLIP_EPS = 0.2
 VALUE_COEF = 0.5
 ENTROPY_COEF = 0.05
@@ -175,7 +192,6 @@ def start_all_episodes(vec_bridge: VecOpenFrontBridge, gold_stats: RunningMeanSt
     deterministic game across every env."""
     return list(vec_bridge.executor.map(lambda b: start_episode(b, gold_stats), vec_bridge.bridges))
 
-
 def run_update(
     vec_bridge: VecOpenFrontBridge,
     agent,
@@ -183,12 +199,9 @@ def run_update(
     episodes: list[EpisodeState],
     update: int,
     gold_stats: RunningMeanStd,
-) -> tuple[list[EpisodeState], int, int]:
-    """One STEPS-length rollout across all NUM_ENVS envs, GAE per env, one PPO
-    update over the flattened STEPS*NUM_ENVS batch. Rollout buffers stay on
-    CPU - too large for VRAM at STEPS=2000 - only per-tick and per-minibatch
-    slices move to DEVICE.
-    """
+    total_train_hours: float,
+) -> tuple[list[EpisodeState], int, int, float]:
+
     rollout_start = time.perf_counter()
 
     n = len(episodes)
@@ -274,7 +287,8 @@ def run_update(
 
             episode.spatial, episode.scalar = encode_observation(
                 episode.land_mask, episode.is_mine, episode.is_enemy, episode.player_stats,
-                episode.agent_small_id, total_land
+                episode.agent_small_id, total_land,
+                step_result["outgoingTroops"], step_result["incomingTroops"],
             )
             entity_features, episode.targets = build_entities(
                 attack_mask, episode.player_stats, episode.player_types, total_land
@@ -404,6 +418,7 @@ def run_update(
     ppo_elapsed = time.perf_counter() - ppo_start
     total_elapsed = rollout_elapsed + ppo_elapsed
     ticks_per_sec = (STEPS * n) / rollout_elapsed
+    total_train_hours += total_elapsed / 3600
 
     print(
         f"update {update}: mean_reward={rewards.mean().item():.3f} "
@@ -413,10 +428,10 @@ def run_update(
         f"value_loss={value_loss_sum / num_minibatches:.4f} "
         f"entropy={entropy_sum / num_minibatches:.4f} "
         f"time={total_elapsed:.1f}s (rollout={rollout_elapsed:.1f}s ppo={ppo_elapsed:.1f}s) "
-        f"ticks/sec={ticks_per_sec:.1f}"
+        f"ticks/sec={ticks_per_sec:.1f} total_train_hours={total_train_hours:.2f}"
     )
 
-    return episodes, episodes_finished, episode_wins
+    return episodes, episodes_finished, episode_wins, total_train_hours
 
 
 def train():
@@ -427,10 +442,12 @@ def train():
     # to the weights that are about to be loaded into the same agent.
     checkpoint_path = latest_checkpoint()
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE) if checkpoint_path is not None else None
+    total_train_hours = 0.0
     if checkpoint is not None:
         gold_stats.mean = checkpoint["gold_mean"]
         gold_stats.var = checkpoint["gold_var"]
         gold_stats.count = checkpoint["gold_count"]
+        total_train_hours = checkpoint.get("total_train_hours", 0.0)
 
     with VecOpenFrontBridge(NUM_ENVS) as vec_bridge:
         episodes = start_all_episodes(vec_bridge, gold_stats)
@@ -447,22 +464,26 @@ def train():
             else:
                 print(f"resumed from {checkpoint_path}")
         optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
+
+        agent.get_action_and_value = torch.compile(agent.get_action_and_value, dynamic=True)
+        agent.get_value = torch.compile(agent.get_value, dynamic=True)
+
         print(f"training on device={DEVICE}, num_envs={NUM_ENVS}")
 
         total_episodes = 0
         total_wins = 0
 
         for update in range(NUM_UPDATES):
-            episodes, episodes_finished, episode_wins = run_update(
-                vec_bridge, agent, optimizer, episodes, update, gold_stats
+            episodes, episodes_finished, episode_wins, total_train_hours = run_update(
+                vec_bridge, agent, optimizer, episodes, update, gold_stats, total_train_hours
             )
             total_episodes += episodes_finished
             total_wins += episode_wins
 
             if update != 0 and update % CHECKPOINT_INTERVAL == 0:
-                save_checkpoint(agent, update, gold_stats)
+                save_checkpoint(agent, update, gold_stats, total_train_hours)
 
-        save_checkpoint(agent, NUM_UPDATES, gold_stats)
+        save_checkpoint(agent, NUM_UPDATES, gold_stats, total_train_hours)
 
         win_rate = total_wins / total_episodes if total_episodes > 0 else 0.0
         print(

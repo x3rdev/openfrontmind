@@ -205,6 +205,10 @@ export interface AttackTarget {
   // re-attacking would just reinforce it (AttackExecution merges troops into the
   // existing attack), so this lets the Python side mask out the redundant reselect.
   alreadyAttacking: boolean;
+  // troops this player currently has committed to an attack against the agent -
+  // 0 if not attacking. The agent could otherwise only see whether *it* can
+  // attack a candidate, not whether that candidate is currently hostile.
+  attackingMeTroops: number;
 }
 
 export interface StepResult {
@@ -215,6 +219,11 @@ export interface StepResult {
   packedTileUpdates?: Uint32Array;
   packedPlayerUpdates?: Float64Array;
   attackMask: AttackTarget[];
+  // Aggregate troop commitment the agent has no other way to perceive: how much
+  // of its own army is already locked into outgoing attacks, and how much total
+  // enemy troop count is currently attacking it.
+  outgoingTroops: number;
+  incomingTroops: number;
   unitUpdates?: UnitUpdate[];
 }
 
@@ -226,32 +235,41 @@ const WILDERNESS_KEY = "__wilderness__";
 function computeAttackMask(
   game: ReturnType<typeof createGame>,
   agentClientID: string,
-): AttackTarget[] {
+): { attackMask: AttackTarget[]; outgoingTroops: number; incomingTroops: number } {
   const agent = game.playerByClientID(agentClientID);
-  if (agent === null) return [];
+  if (agent === null) return { attackMask: [], outgoingTroops: 0, incomingTroops: 0 };
 
+  const outgoing = agent.outgoingAttacks().filter((a) => a.isActive());
   const activeTargets = new Set(
-    agent
-      .outgoingAttacks()
-      .filter((a) => a.isActive())
-      .map((a) => (a.target().isPlayer() ? (a.target() as Player).id() : WILDERNESS_KEY)),
+    outgoing.map((a) => (a.target().isPlayer() ? (a.target() as Player).id() : WILDERNESS_KEY)),
+  );
+  const outgoingTroops = outgoing.reduce((sum, a) => sum + a.troops(), 0);
+
+  const incoming = agent.incomingAttacks().filter((a) => a.isActive());
+  const incomingTroops = incoming.reduce((sum, a) => sum + a.troops(), 0);
+  const incomingByAttacker = new Map<PlayerID, number>();
+  for (const a of incoming) {
+    const attackerID = a.attacker().id();
+    incomingByAttacker.set(attackerID, (incomingByAttacker.get(attackerID) ?? 0) + a.troops());
+  }
+
+  const attackMask = agent.nearby().map((p) =>
+    p.isPlayer()
+      ? {
+          targetID: p.id(),
+          smallID: p.smallID(),
+          alreadyAttacking: activeTargets.has(p.id()),
+          attackingMeTroops: incomingByAttacker.get(p.id()) ?? 0,
+        }
+      : {
+          targetID: null,
+          smallID: null,
+          alreadyAttacking: activeTargets.has(WILDERNESS_KEY),
+          attackingMeTroops: 0,
+        },
   );
 
-  return agent
-    .nearby()
-    .map((p) =>
-      p.isPlayer()
-        ? {
-            targetID: p.id(),
-            smallID: p.smallID(),
-            alreadyAttacking: activeTargets.has(p.id()),
-          }
-        : {
-            targetID: null,
-            smallID: null,
-            alreadyAttacking: activeTargets.has(WILDERNESS_KEY),
-          },
-    );
+  return { attackMask, outgoingTroops, incomingTroops };
 }
 
 export function step(
@@ -265,6 +283,7 @@ export function step(
     throw new Error(`game errored during step:\n${state.fatalError}`);
   }
   const winner = game.getWinner();
+  const { attackMask, outgoingTroops, incomingTroops } = computeAttackMask(game, session.agentClientID);
   return {
     tick: game.ticks(),
     playersAlive: game.players().filter((p) => p.isAlive()).length,
@@ -272,7 +291,9 @@ export function step(
     winner,
     packedTileUpdates: state.packedTileUpdates,
     packedPlayerUpdates: state.packedPlayerUpdates,
-    attackMask: computeAttackMask(game, session.agentClientID),
+    attackMask,
+    outgoingTroops,
+    incomingTroops,
     unitUpdates: state.unitUpdates,
   };
 }

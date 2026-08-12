@@ -1,5 +1,5 @@
-WIN_REWARD = 100.0
-LOSS_REWARD = -100.0
+WIN_REWARD = 1000.0
+LOSS_REWARD = -1000.0
 SCALE = 100.0
 
 # Peak of the engine's troop production formula (Config.ts troopIncreaseRate()).

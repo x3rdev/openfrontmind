@@ -131,6 +131,8 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       packedTileUpdates: toBase64(result.packedTileUpdates),
       packedPlayerUpdates: toBase64(result.packedPlayerUpdates),
       attackMask: result.attackMask,
+      outgoingTroops: result.outgoingTroops,
+      incomingTroops: result.incomingTroops,
       unitUpdates: result.unitUpdates,
       maxTroops: maxTroopsBySmallID(session),
       totalLand: totalLand(session),
@@ -160,7 +162,7 @@ rl.on("line", (line) => {
     try {
       await handle(cmd);
     } catch (e) {
-      send({ cmd_success: false, error: (e as Error).message });
+      send({ cmd_success: false, error: (e as Error).message, stack: (e as Error).stack });
     }
   });
 });

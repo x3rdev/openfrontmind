@@ -4,8 +4,7 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 training/models/checkpoints/
-training/models/checkpoints_saved/
-training/models/checkpoints_pre_*/
+training/models/checkpoints_*/
 training/logs/
 
 # Node

@@ -12,8 +12,22 @@ def _worker(conn, seed, map, bots, nations):
             bridge.process.wait()
             conn.close()
             return
-        res = bridge.reset(**payload) if cmd == "reset" else bridge.step(payload)
+        # An uncaught exception here would kill this worker process outright,
+        # closing its end of the pipe - the parent's conn.recv() would then
+        # raise an opaque EOFError with no indication of which env or why.
+        # Forwarding a normal-shaped error response keeps the worker alive and
+        # lets the parent raise one clear, attributable error instead.
+        try:
+            res = bridge.reset(**payload) if cmd == "reset" else bridge.step(payload)
+        except Exception as e:
+            res = {"cmd_success": False, "error": f"{type(e).__name__}: {e}"}
         conn.send(res)
+
+
+def _check(res: dict, env_idx: int, cmd: str) -> dict:
+    if not res.get("cmd_success", True):
+        raise RuntimeError(f"env {env_idx} server error on {cmd}: {res.get('error')}")
+    return res
 
 
 class _BridgeProxy:
@@ -21,12 +35,13 @@ class _BridgeProxy:
     # this pipe, not here - profiling showed N threads all doing that
     # CPU-bound decode in the parent contend for one GIL badly enough to
     # outweigh the I/O parallelism threads were chosen for.
-    def __init__(self, conn):
+    def __init__(self, conn, env_idx: int):
         self.conn = conn
+        self.env_idx = env_idx
 
     def reset(self, **kwargs):
         self.conn.send(("reset", kwargs))
-        return self.conn.recv()
+        return _check(self.conn.recv(), self.env_idx, "reset")
 
 
 class VecOpenFrontBridge():
@@ -42,7 +57,7 @@ class VecOpenFrontBridge():
             p.start()
             self.conns.append(parent_conn)
             self.procs.append(p)
-        self.bridges = [_BridgeProxy(c) for c in self.conns]
+        self.bridges = [_BridgeProxy(c, i) for i, c in enumerate(self.conns)]
         # only for occasional concurrent resets (start_all_episodes / per-slot
         # reset) - step() below talks to the pipes directly since that's the
         # hot path where GIL contention across threads actually showed up.
@@ -51,12 +66,12 @@ class VecOpenFrontBridge():
     def reset(self, **kwargs):
         for conn in self.conns:
             conn.send(("reset", kwargs))
-        return [conn.recv() for conn in self.conns]
+        return [_check(conn.recv(), i, "reset") for i, conn in enumerate(self.conns)]
 
     def step(self, intents_list):
         for conn, intents in zip(self.conns, intents_list):
             conn.send(("step", intents))
-        return [conn.recv() for conn in self.conns]
+        return [_check(conn.recv(), i, "step") for i, conn in enumerate(self.conns)]
 
     def __enter__(self):
         return self
