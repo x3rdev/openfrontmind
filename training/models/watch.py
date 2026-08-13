@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -14,7 +15,7 @@ from training.models.train import latest_checkpoint, BOTS, NATIONS, DIFFICULTY
 
 
 def main(
-    checkpoint_path: str, seed: str, scale: int, headless: bool = False, diagnostic: bool = False,
+    checkpoint_path: str | Path, seed: str, scale: int, headless: bool = False, diagnostic: bool = False,
     log_probs: bool = False, prob_log_interval: int = 1,
     log_value: bool = False, value_log_interval: int = 1,
     bots: int = BOTS, nations: int = NATIONS, difficulty: str = DIFFICULTY,
