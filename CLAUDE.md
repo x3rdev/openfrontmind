@@ -591,6 +591,79 @@ same `--diagnostic`/`--log-probs`/`--log-value` methodology re-run once this has
 enough updates to say something, plus the trained-vs-dumb-baseline comparison used
 to catch the original stuck-learning bug.
 
+**Rollout collection now overlaps with the PPO phase (`train.py`).** Split the old
+`run_update()` into `collect_rollout()` and `ppo_update()`, connected by a `Rollout`
+dataclass. `train()` runs a `ThreadPoolExecutor(max_workers=1)`: each update submits
+the *next* update's `collect_rollout()` (against a separate `collector_agent` instance
+holding its own weight copy, refreshed via `load_state_dict()` right before submit)
+while `ppo_update()` trains `agent` on the *current* rollout on the main thread, then
+joins before the next iteration. Threading (not multiprocessing) because collection is
+CPU/pipe-I/O-bound against `VecOpenFrontBridge`, not GPU-bound. `collector_agent`
+exists specifically so the collection thread never reads/writes the same parameter
+tensors `ppo_update()`'s `backward()`/`optimizer.step()` is concurrently mutating -
+`load_state_dict()` copies values into independent storage, verified via a standalone
+smoke test (mutate one agent's params on the main thread while the other's forward
+pass runs on a pool thread; no corruption). Target win: per-update wall time closer to
+`max(rollout, ppo)` than `rollout + ppo`. **Known tradeoff, accepted for now**: rollout
+N is collected using `agent`'s weights from *before* update N-1's PPO step, one update
+more stale than the within-epoch drift `PPO_EPOCHS`/`CLIP_EPS` already tolerate. Not
+adding V-trace-style importance correction unless diagnostics later show this
+staleness actually matters.
+
+**`torch.compile` and the bigger `MINIBATCH_SIZE`, tried and reverted - both were
+regressions, not speedups.** Benchmarked all three throughput changes together
+(`STEPS=500, NUM_ENVS=16`, fresh uncompiled/compiled agents, checkpoints untouched) by
+running `collect_rollout()`/`ppo_update()` standalone outside a real `train()` session:
+
+- **Baseline** (sequential, uncompiled, `MINIBATCH_SIZE=256`): 19.79s/update.
+- **`torch.compile(dynamic=True)` + `MINIBATCH_SIZE=1024`, still sequential**: 91.85s/
+  update - **4.6x slower**.
+- **Same, plus the threaded overlap**: 135.56s/update - **6.8x slower than baseline**,
+  and *degrading every update* (96s -> 120s -> 191s, rollout `ticks/sec` collapsing
+  781 -> 67 across 4 updates).
+
+**Follow-up isolated the two changes - it was `MINIBATCH_SIZE=1024` doing essentially
+all of the damage, not `torch.compile`.** The numbers above never isolated which
+change caused the regression; a same-shaped re-run with `MINIBATCH_SIZE=1024` alone
+(no compile) hit 96.79s/update - **4.7x slower**, with the identical escalating-across-
+updates pattern (76s -> 79s -> 74s -> 123s -> 111s) blamed on compile earlier. Since
+the mb1024-alone number (96.79s) lands in the same range as the mb1024+compile number
+(91.85s), `torch.compile` wasn't adding a meaningful additional penalty on top -
+the original writeup's explanation (Inductor kernel-launch overhead) was a plausible-
+sounding guess stated as fact without ever running the isolating experiment, and it
+was wrong. Best current guess at the real mechanism: a 4x bigger minibatch means a 4x
+bigger `(batch, 3, H, W)` spatial tensor per forward/backward pass through
+`PPO_EPOCHS=4` - on `mid_plains` that's a meaningful chunk of the RTX 3070's 8GB VRAM
+per minibatch, and the escalating-slower-each-update pattern looks like GPU allocator
+fragmentation/thrashing building up across updates, not a compile artifact. Not yet
+confirmed with a memory profiler - stated as a hypothesis, not a verified cause.
+
+Separately, the threaded-overlap-specific regression (config C, on top of both of the
+above) has its own explanation: the overlap design assumed `collect_rollout()` was
+I/O-bound against `VecOpenFrontBridge`'s pipes and would release the GIL, letting it
+run alongside the GPU-bound PPO thread on the main thread. In fact the per-tick
+Python loop does real CPU-bound work between pipe calls (numpy stacking, tensor
+construction) that holds the GIL and directly contends with the main thread - the
+same class of GIL-contention problem `VecOpenFrontBridge` itself already hit and
+solved by switching to `multiprocessing` instead of `ThreadPoolExecutor` for its hot
+path (see the parallelization notes above). This part of the diagnosis held up: see
+below, the overlap is a confirmed real win once measured without `MINIBATCH_SIZE=1024`
+in the mix, and the GIL contention it does have is small enough not to erase that win.
+
+**Reverted**: `MINIBATCH_SIZE` back to 256, `torch.compile` calls removed entirely.
+**Kept, and confirmed to actually help once decoupled from `torch.compile`**: the
+`collect_rollout()`/`ppo_update()`/`Rollout` split and the threaded overlap. Re-ran
+the same `STEPS=500, NUM_ENVS=16` benchmark with `torch.compile` out of the picture:
+sequential 21.73s/update vs. overlapped 16.31s/update - a real **24.9% win**, and
+unlike the compiled version, *stable* across every measured update (16.0-16.5s, no
+drift), confirming the earlier degradation was specific to `torch.compile`
+compounding across the two threads, not a property of the threading design itself.
+The GIL contention flagged above is real but small: the collector thread's own
+rollout phase does measurably slow down under contention (~16-17s vs ~12-14s run
+alone), it's just cheap enough that overlapping it with PPO's ~9-11s still nets a win
+rather than erasing one. Not pursuing a process-based collector for now given the
+thread version already delivers a solid win with much less complexity.
+
 ## Licensing note
 
 Upstream OpenFrontIO is AGPLv3 (network copyleft — matters only if we run a modified

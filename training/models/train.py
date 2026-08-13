@@ -1,4 +1,5 @@
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from training.models.policy import Agent
 # ~2100-2150 ticks the whole time, meaning a chunk of episodes straddled the rollout
 # boundary and never gave GAE their real terminal win/loss reward within one update.
 STEPS = 3000
-NUM_UPDATES = 720
+NUM_UPDATES = 10000
 NUM_ENVS = 16
 
 # Tried bots=1,nations=0 briefly (single weak Tribe) to unstick a value function that
@@ -40,15 +41,17 @@ NUM_ENVS = 16
 # act before a fast-scaling opponent grows out of reach seems to have dragged the
 # whole policy toward more aggression on average, not less.
 #
-# Now trying nations=10 (still fixed Easy) instead - a bigger lobby rather than a
-# stronger single opponent. Known risk from an earlier dumb-policy diagnostic this
-# session: more competing players caps the achievable tile-share ceiling and raises
-# elimination risk independent of learning (bots=9,nations=0 -> peak 26-28%, 3/3
-# full elimination even with zero learning involved). Worth watching for that same
-# ceiling-capping effect showing up here before reading too much into any win-rate
-# change.
+# Tried nations=10 (bigger lobby instead of a stronger single opponent) next, to
+# address the same low-outcome-diversity problem - reverted before ever training
+# against it: the gated action head fix (see CLAUDE.md) hasn't been validated on
+# its own yet, and nations=10 would confound that validation with the already-known
+# ceiling-capping risk from the bots=9,nations=0 dumb-policy diagnostic (peak
+# 26-28%, elimination even with zero learning involved). Back to nations=1 to
+# isolate the gated-head validation against the known, mechanically-verified
+# patience-heuristic ceiling (100% win rate, ~80% peak) before reintroducing a
+# bigger lobby as a separate next step.
 BOTS = 0
-NATIONS = 10
+NATIONS = 1
 # never set explicitly before now - bridge.reset()/harness.ts silently defaulted to
 # Easy the whole time. Setting it explicitly so it can't silently drift (same class
 # of bug as watch.py's stale hardcoded bots=3,nations=1 found earlier this session).
@@ -92,7 +95,7 @@ LR = 1e-4
 GAMMA = 0.999667  # horizon = STEPS = 3000
 GAE_LAMBDA = 0.95
 PPO_EPOCHS = 4
-MINIBATCH_SIZE = 1024  # was 256, GPU util sat ~60% there
+MINIBATCH_SIZE = 256
 CLIP_EPS = 0.2
 VALUE_COEF = 0.5
 ENTROPY_COEF = 0.05
@@ -115,6 +118,25 @@ class EpisodeState:
     entities: np.ndarray
     entity_mask: np.ndarray
     targets: list
+
+
+@dataclass
+class Rollout:
+    spatial: np.ndarray
+    scalar: np.ndarray
+    entities: np.ndarray
+    entity_mask: np.ndarray
+    actions: np.ndarray
+    log_probs: np.ndarray
+    values: np.ndarray
+    rewards: np.ndarray
+    dones: np.ndarray
+    last_value: torch.Tensor
+    num_envs: int
+    episodes_finished: int
+    episode_wins: int
+    episode_end_golds: list[float]
+    elapsed: float
 
 
 def _apply_gold_stats(scalar: np.ndarray, entity_features: np.ndarray, gold_stats: RunningMeanStd) -> None:
@@ -176,7 +198,7 @@ def _episode_state_from_setup(setup: dict, gold_stats: RunningMeanStd) -> Episod
 
 
 def start_episode(bridge, gold_stats: RunningMeanStd) -> EpisodeState:
-    """Used for standalone scripts and per-slot resets in run_update."""
+    """Used for standalone scripts and per-slot resets in collect_rollout."""
     setup = bridge.reset(
         seed=str(random.randint(0, 2 ** 31 - 1)),
         map="mid_plains",
@@ -192,33 +214,25 @@ def start_all_episodes(vec_bridge: VecOpenFrontBridge, gold_stats: RunningMeanSt
     deterministic game across every env."""
     return list(vec_bridge.executor.map(lambda b: start_episode(b, gold_stats), vec_bridge.bridges))
 
-def run_update(
+def collect_rollout(
     vec_bridge: VecOpenFrontBridge,
     agent,
-    optimizer,
     episodes: list[EpisodeState],
-    update: int,
     gold_stats: RunningMeanStd,
-    total_train_hours: float,
-) -> tuple[list[EpisodeState], int, int, float]:
-
+) -> tuple[list[EpisodeState], Rollout]:
     rollout_start = time.perf_counter()
 
-    n = len(episodes)
-    # bool, not float32 - spatial planes are binary (is_land/is_mine/is_enemy) and this
-    # buffer is STEPS*n*3*H*W, the single biggest allocation in the whole rollout by
-    # far; 4x smaller here is the difference between fitting in RAM and not on bigger
-    # maps. Cast back to float only for the per-minibatch GPU slice that needs it.
-    spatial_buf = np.zeros((STEPS, n, *episodes[0].spatial.shape), dtype=np.bool)
-    scalar_buf = np.zeros((STEPS, n, *episodes[0].scalar.shape), dtype=np.float32)
-    entities_buf = np.zeros((STEPS, n, *episodes[0].entities.shape), dtype=np.float32)
-    entity_masks = np.zeros((STEPS, n, *episodes[0].entity_mask.shape), dtype=np.bool)
-    actions = np.zeros((STEPS, n))
-    log_probs = np.zeros((STEPS, n))
-    values = np.zeros((STEPS, n))
-    rewards = np.zeros((STEPS, n))
-    dones = np.zeros((STEPS, n), dtype=np.bool)
-    wins = np.zeros((STEPS, n), dtype=np.bool)
+    num_envs = len(episodes)
+    spatial_buf = np.zeros((STEPS, num_envs, *episodes[0].spatial.shape), dtype=np.bool)
+    scalar_buf = np.zeros((STEPS, num_envs, *episodes[0].scalar.shape), dtype=np.float32)
+    entities_buf = np.zeros((STEPS, num_envs, *episodes[0].entities.shape), dtype=np.float32)
+    entity_masks = np.zeros((STEPS, num_envs, *episodes[0].entity_mask.shape), dtype=np.bool)
+    actions = np.zeros((STEPS, num_envs))
+    log_probs = np.zeros((STEPS, num_envs))
+    values = np.zeros((STEPS, num_envs))
+    rewards = np.zeros((STEPS, num_envs))
+    dones = np.zeros((STEPS, num_envs), dtype=np.bool)
+    wins = np.zeros((STEPS, num_envs), dtype=np.bool)
     episode_end_golds = []
 
     for i in range(STEPS):
@@ -244,11 +258,11 @@ def run_update(
                 target=episodes[k].targets[actions_np[k]] if actions_np[k] < len(episodes[k].targets) else DO_NOTHING,
                 agent_client_id=episodes[k].agent_client_id,
             )
-            for k in range(n)
+            for k in range(num_envs)
         ]
         step_results = vec_bridge.step(intents_list)
 
-        for k in range(n):
+        for k in range(num_envs):
             episode = episodes[k]
             step_result = step_results[k]
             attack_mask = step_result["attackMask"]
@@ -315,20 +329,47 @@ def run_update(
             entity_mask=torch.from_numpy(last_entity_mask).to(DEVICE),
         ).squeeze(-1).cpu()
 
-    spatial_buf = torch.from_numpy(spatial_buf)
-    scalar_buf = torch.from_numpy(scalar_buf)
-    entities_buf = torch.from_numpy(entities_buf)
-    entity_masks = torch.from_numpy(entity_masks)
-    actions = torch.from_numpy(actions)
-    log_probs = torch.from_numpy(log_probs)
-    values = torch.from_numpy(values)
-    rewards = torch.from_numpy(rewards)
-    dones = torch.from_numpy(dones)
+    rollout = Rollout(
+        spatial=spatial_buf,
+        scalar=scalar_buf,
+        entities=entities_buf,
+        entity_mask=entity_masks,
+        actions=actions,
+        log_probs=log_probs,
+        values=values,
+        rewards=rewards,
+        dones=dones,
+        last_value=last_value,
+        num_envs=num_envs,
+        episodes_finished=int(dones.sum().item()),
+        episode_wins = int(wins.sum().item()),
+        episode_end_golds = episode_end_golds,
+        elapsed = time.perf_counter()-rollout_start)
 
-    running_advantage = torch.zeros(n)
-    next_value = last_value
-    advantages = torch.zeros(STEPS, n)
-    returns = torch.zeros(STEPS, n)
+    return episodes, rollout
+
+def ppo_update(
+    rollout: Rollout,
+    agent,
+    optimizer,
+    update: int,
+    total_train_hours: float,
+) -> tuple[int, int, float]:
+
+    spatial_buf = torch.from_numpy(rollout.spatial)
+    scalar_buf = torch.from_numpy(rollout.scalar)
+    entities_buf = torch.from_numpy(rollout.entities)
+    entity_masks = torch.from_numpy(rollout.entity_mask)
+    actions = torch.from_numpy(rollout.actions)
+    log_probs = torch.from_numpy(rollout.log_probs)
+    values = torch.from_numpy(rollout.values)
+    rewards = torch.from_numpy(rollout.rewards)
+    dones = torch.from_numpy(rollout.dones)
+
+    running_advantage = torch.zeros(rollout.num_envs)
+    next_value = rollout.last_value
+    advantages = torch.zeros(STEPS, rollout.num_envs)
+    returns = torch.zeros(STEPS, rollout.num_envs)
 
     for t in reversed(range(STEPS)):
         non_term = 1 - dones[t].float()
@@ -342,8 +383,8 @@ def run_update(
 
     advantages = (advantages-advantages.mean()) / (advantages.std()+1e-8)
 
-    # flatten (STEPS, n, ...) -> (STEPS*n, ...) for minibatching
-    total = STEPS * n
+    # flatten (STEPS, num_envs, ...) -> (STEPS*num_envs, ...) for minibatching
+    total = STEPS * rollout.num_envs
     spatial_buf = spatial_buf.reshape(total, *spatial_buf.shape[2:])
     scalar_buf = scalar_buf.reshape(total, *scalar_buf.shape[2:])
     entities_buf = entities_buf.reshape(total, *entities_buf.shape[2:])
@@ -354,7 +395,7 @@ def run_update(
     returns = returns.reshape(total)
     values = values.reshape(total)
 
-    rollout_elapsed = time.perf_counter() - rollout_start
+    rollout_elapsed = rollout.elapsed
     ppo_start = time.perf_counter()
 
     policy_loss_sum = 0.0
@@ -411,18 +452,18 @@ def run_update(
             entropy_sum += entropy_bonus.item()
             num_minibatches += 1
 
-    episodes_finished = int(dones.sum().item())
-    episode_wins = int(wins.sum().item())
-    mean_gold_at_done = sum(episode_end_golds) / len(episode_end_golds) if episode_end_golds else 0.0
+    mean_gold_at_done = (
+        sum(rollout.episode_end_golds) / len(rollout.episode_end_golds) if rollout.episode_end_golds else 0.0
+    )
 
     ppo_elapsed = time.perf_counter() - ppo_start
     total_elapsed = rollout_elapsed + ppo_elapsed
-    ticks_per_sec = (STEPS * n) / rollout_elapsed
+    ticks_per_sec = (STEPS * rollout.num_envs) / rollout_elapsed
     total_train_hours += total_elapsed / 3600
 
     print(
         f"update {update}: mean_reward={rewards.mean().item():.3f} "
-        f"episodes_finished={episodes_finished} wins={episode_wins} "
+        f"episodes_finished={rollout.episodes_finished} wins={rollout.episode_wins} "
         f"mean_gold_at_done={mean_gold_at_done:,.0f} "
         f"policy_loss={policy_loss_sum / num_minibatches:.4f} "
         f"value_loss={value_loss_sum / num_minibatches:.4f} "
@@ -431,7 +472,7 @@ def run_update(
         f"ticks/sec={ticks_per_sec:.1f} total_train_hours={total_train_hours:.2f}"
     )
 
-    return episodes, episodes_finished, episode_wins, total_train_hours
+    return rollout.episodes_finished, rollout.episode_wins, total_train_hours
 
 
 def train():
@@ -465,23 +506,45 @@ def train():
                 print(f"resumed from {checkpoint_path}")
         optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
 
-        agent.get_action_and_value = torch.compile(agent.get_action_and_value, dynamic=True)
-        agent.get_value = torch.compile(agent.get_value, dynamic=True)
+        # collect_rollout runs concurrently with ppo_update's backward()/optimizer.step()
+        # on `agent` (see the ThreadPoolExecutor loop below) - a separate agent instance
+        # holding its own copy of the weights avoids concurrently reading and mutating
+        # the same parameter tensors from two threads. Its weights are refreshed from
+        # `agent` once per update, right before that update's collection is kicked off.
+        collector_agent = Agent.from_observation(
+            episodes[0].spatial, episodes[0].scalar, episodes[0].entities
+        ).to(DEVICE)
+        collector_agent.load_state_dict(agent.state_dict())
 
         print(f"training on device={DEVICE}, num_envs={NUM_ENVS}")
 
         total_episodes = 0
         total_wins = 0
 
-        for update in range(NUM_UPDATES):
-            episodes, episodes_finished, episode_wins, total_train_hours = run_update(
-                vec_bridge, agent, optimizer, episodes, update, gold_stats, total_train_hours
-            )
-            total_episodes += episodes_finished
-            total_wins += episode_wins
+        # Primes the pipeline with one synchronous collection - there's no previous
+        # update's PPO phase to overlap it with yet.
+        episodes, rollout = collect_rollout(vec_bridge, collector_agent, episodes, gold_stats)
 
-            if update != 0 and update % CHECKPOINT_INTERVAL == 0:
-                save_checkpoint(agent, update, gold_stats, total_train_hours)
+        with ThreadPoolExecutor(max_workers=1) as collector_pool:
+            for update in range(NUM_UPDATES):
+                # Snapshot before ppo_update starts mutating `agent`'s weights below -
+                # load_state_dict copies values into collector_agent's own tensors, so
+                # the collection thread never touches `agent`'s tensors directly.
+                collector_agent.load_state_dict(agent.state_dict())
+                next_rollout_future = collector_pool.submit(
+                    collect_rollout, vec_bridge, collector_agent, episodes, gold_stats
+                )
+
+                episodes_finished, episode_wins, total_train_hours = ppo_update(
+                    rollout, agent, optimizer, update, total_train_hours
+                )
+                total_episodes += episodes_finished
+                total_wins += episode_wins
+
+                episodes, rollout = next_rollout_future.result()
+
+                if update != 0 and update % CHECKPOINT_INTERVAL == 0:
+                    save_checkpoint(agent, update, gold_stats, total_train_hours)
 
         save_checkpoint(agent, NUM_UPDATES, gold_stats, total_train_hours)
 

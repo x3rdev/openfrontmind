@@ -4,8 +4,7 @@ SCALE = 100.0
 
 # Peak of the engine's troop production formula (Config.ts troopIncreaseRate()).
 TROOP_RATIO_TARGET = 0.422
-SHAPING_COEF = 1.0  # bumped 0.1 -> 0.3 -> 1.0; diagnostic at update224 still showed
-# mean_attack_troop_ratio ~0.01 (attacking near-zero troops), so 0.3 wasn't enough
+SHAPING_COEF = 0.3  # was 1.0, overshot into troop hoarding
 
 
 def _troop_potential(ratio: float) -> float:
