@@ -12,8 +12,8 @@ path handles every candidate uniformly.
 import numpy as np
 
 # [is_tribe, is_nation, is_wilderness, is_do_nothing, tile_fraction, log_gold, troop_ratio,
-#  attacking_me_ratio]
-ENTITY_FEATURES = 8
+#  attacking_me_ratio, already_attacking]
+ENTITY_FEATURES = 9
 
 # Buffer-size cap, not a meaningful-identity cap like the old ATTACK_SLOTS - truncation
 # just means "ignore the least-relevant excess candidates this one tick," not "this
@@ -39,8 +39,12 @@ def build_entities(
     rows = []
     targets = []
     for c in attack_mask:
-        if c["alreadyAttacking"]:
-            continue
+        # Previously skipped entirely - but land attacks toward the same target merge
+        # into the existing one (AttackExecution.execute(), the engine's outgoing-attack
+        # combine loop), so reselecting is a legal "reinforce" action, not a no-op. Keeping
+        # the row also means the network doesn't lose visibility into an opponent the
+        # moment it commits to attacking them.
+        already_attacking = float(c["alreadyAttacking"])
         if c["targetID"] is not None:
             stats = player_stats.get(c["smallID"], {})
             ptype = player_types.get(c["smallID"], "BOT")
@@ -60,13 +64,14 @@ def build_entities(
                 float(np.log1p(stats.get("gold", 0.0))),
                 troop_ratio,
                 attacking_me_ratio,
+                already_attacking,
             ])
             targets.append(c["targetID"])
         else:
-            rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, already_attacking])
             targets.append(None)
 
-    rows.append([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+    rows.append([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     targets.append(DO_NOTHING)
 
     return np.array(rows, dtype=np.float32), targets

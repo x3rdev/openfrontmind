@@ -5,12 +5,7 @@ from torch.distributions import Categorical
 
 
 class EntityEncoder(nn.Module):
-    """Shared per-entity MLP + attention pooling (Deep Sets / Set Transformer style).
-
-    Permutation-invariant and works for any entity count N: the same weights embed
-    every entity, and a learned query attends over them into one fixed-size context
-    vector - no hard-coded slot count baked into what a given position "means".
-    """
+    """Shared per-entity MLP + attention pooling - permutation-invariant, any N."""
 
     def __init__(self, entity_dim: int, embed_dim: int = 64):
         super().__init__()
@@ -34,25 +29,18 @@ class EntityEncoder(nn.Module):
 
 
 CONV_OUT_CHANNELS = 32
-# Collapses the conv output to a fixed 6x6 grid regardless of map size, instead of
-# flattening the full H*W grid straight into a Linear layer. The old flatten made that
-# one layer ~97-99% of the network's entire param count (worse on bigger maps, since
-# it scales with H*W) and tied the network's shape to a specific map resolution.
-# Pooling keeps coarse spatial layout (which region is contested) while making the
-# backbone's size independent of map dimensions - and, as a side effect, means the
-# network no longer needs height/width to be constructed.
-POOL_SIZE = 6
+# fixed-size regardless of map dims, unlike flattening the full H*W grid (old approach,
+# ~97-99% of all params in one layer). Backbone no longer needs height/width either.
+POOL_SIZE = 16
 
 
 class Backbone(nn.Module):
-    """Shared CNN + entity encoder + merge MLP: observation -> one hidden vector,
-    reused by both the value head and the pointer action head.
-    """
+    """Shared CNN + entity encoder + merge MLP -> one hidden vector for both heads."""
 
-    def __init__(self, scalar_dim: int, entity_dim: int, entity_embed_dim: int = 64):
+    def __init__(self, spatial_channels: int, scalar_dim: int, entity_dim: int, entity_embed_dim: int = 64):
         super().__init__()
         self.conv_stack = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(spatial_channels, 16, kernel_size=3, stride=2, padding=1), nn.ReLU(),
             nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), nn.ReLU(),
             nn.Conv2d(32, CONV_OUT_CHANNELS, kernel_size=3, stride=2, padding=1), nn.ReLU(),
         )
@@ -75,38 +63,37 @@ class Backbone(nn.Module):
 
 
 class Agent(nn.Module):
-    def __init__(self, scalar_dim: int, entity_dim: int, entity_embed_dim: int = 64):
+    def __init__(self, spatial_channels: int, scalar_dim: int, entity_dim: int, entity_embed_dim: int = 64):
         super().__init__()
         self.entity_embed_dim = entity_embed_dim
-        self.backbone = Backbone(scalar_dim, entity_dim, entity_embed_dim)
-        self.value_head = nn.Linear(256, 1)
-        # Projects backbone hidden state into entity-embedding space so it can be
-        # dot-producted against each candidate's embedding (pointer-network style
-        # target selection) - replaces the old fixed Linear(256, TOTAL_ACTIONS) head.
+        self.backbone = Backbone(spatial_channels, scalar_dim, entity_dim, entity_embed_dim)
+        # more capacity than a bare Linear - see CLAUDE.md, value-trace diagnostic.
+        self.value_head = nn.Sequential(
+            nn.Linear(256 + scalar_dim, 128), nn.ReLU(),
+            nn.Linear(128, 1),
+        )
+        # pointer-network target selection: dot-product against each candidate's embedding
         self.query_proj = nn.Linear(256, entity_embed_dim)
-        # Separates "should I act at all" from "which target" into its own binary
-        # decision (see get_action_and_value) instead of do_nothing being one option
-        # competing against however many attack candidates happen to exist that tick -
-        # the entangled-softmax problem diagnosed this session (CLAUDE.md).
-        self.gate_head = nn.Linear(256, 2)  # logits: [wait, act]
+        # separates "act at all" from "which target" - see CLAUDE.md's entangled-softmax fix.
+        # scalar concatenated directly (same shortcut value_head has above) - troop_ratio is
+        # the decisive signal for this decision and shouldn't have to survive compression
+        # through the shared backbone bottleneck to reach it, same reasoning that motivated
+        # value_head's own scalar skip-connection.
+        self.gate_head = nn.Linear(256 + scalar_dim, 2)  # logits: [wait, act]
 
     @classmethod
     def from_observation(cls, spatial: np.ndarray, scalar: np.ndarray, entities: np.ndarray) -> "Agent":
-        """Build an Agent sized to match a real observation (e.g. from
-        encode_observation / build_entities) instead of hand-passed dimensions -
-        every dimension is read directly off real data. spatial's shape no longer
-        matters for sizing (pooling makes the backbone map-size-independent) but is
-        still accepted to keep call sites symmetric with the other two arrays.
-        """
+        """Sizes an Agent from a real observation instead of hand-passed dimensions."""
+        spatial_channels = spatial.shape[0]
         scalar_dim = scalar.shape[0]
         entity_dim = entities.shape[-1]
-        return cls(scalar_dim=scalar_dim, entity_dim=entity_dim)
+        return cls(spatial_channels=spatial_channels, scalar_dim=scalar_dim, entity_dim=entity_dim)
 
     def get_value(
         self, spatial: torch.Tensor, scalar: torch.Tensor, entities: torch.Tensor, entity_mask: torch.Tensor
     ) -> torch.Tensor:
         hidden, _ = self.backbone(spatial, scalar, entities, entity_mask)
-        return self.value_head(hidden)
+        return self.value_head(torch.cat([hidden, scalar], dim=-1))
 
     def get_action_and_value(
         self,
@@ -116,26 +103,22 @@ class Agent(nn.Module):
         entity_mask: torch.Tensor,
         action: torch.Tensor | None = None,
         return_probs: bool = False,
+        return_entropy_components: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         hidden, entity_embeds = self.backbone(spatial, scalar, entities, entity_mask)
 
-        # column 3 = is_do_nothing (see action_space.py's ENTITY_FEATURES layout).
-        # Excluding it from target scoring, and deciding act-vs-wait as its own gate,
-        # keeps "should I attack at all" a stable binary choice instead of one option
-        # diluted by however many attack candidates happen to exist this tick.
         is_do_nothing = entities[..., 3] > 0.5
-        real_target_mask = entity_mask & ~is_do_nothing
+        is_already_attacking = entities[..., 8] > 0.5
+        real_target_mask = entity_mask & ~is_do_nothing & ~is_already_attacking
         can_act = real_target_mask.any(dim=-1)
-        # first (only) True per row - unless do_nothing was truncated away by
-        # pad_entities' MAX_ENTITIES cap, same edge case noted in watch.py.
-        do_nothing_idx = is_do_nothing.float().argmax(dim=-1)
+        do_nothing_idx = is_do_nothing.float().argmax(dim=-1)  # first True, per watch.py's truncation caveat
 
         query = self.query_proj(hidden)
         target_scores = torch.einsum("bnd,bd->bn", entity_embeds, query) / self.entity_embed_dim ** 0.5
         target_scores = target_scores.masked_fill(~real_target_mask, -1e8)
         target_dist = Categorical(logits=target_scores)
 
-        gate_logits = self.gate_head(hidden)
+        gate_logits = self.gate_head(torch.cat([hidden, scalar], dim=-1))
         wait_logit = gate_logits[:, 0]
         # no legal target this tick (e.g. no border candidates) - force wait.
         act_logit = torch.where(can_act, gate_logits[:, 1], torch.full_like(gate_logits[:, 1], -1e8))
@@ -144,26 +127,50 @@ class Agent(nn.Module):
         if action is None:
             gate_action = gate_dist.sample()
             target_action = target_dist.sample()
-            action = torch.where(gate_action == 1, target_action, do_nothing_idx)
+            action = torch.where(gate_action == torch.tensor(1), target_action, do_nothing_idx)
 
-        # act iff the (given or just-sampled) action isn't the do_nothing row -
-        # recovers the gate choice uniformly for both the sampling and PPO-recompute
-        # paths instead of branching on whether `action` was passed in.
+        # acted iff action isn't the do_nothing row - recovers the gate choice uniformly
         acted = (action != do_nothing_idx).long()
-        # target_dist.log_prob is only meaningful when acted==1; do_nothing's row is
-        # masked to -1e8 in target_scores (finite, not inf) so this can't produce a
-        # NaN even when acted==0 zeroes its contribution out.
         log_prob = gate_dist.log_prob(acted) + acted.float() * target_dist.log_prob(action)
-        # H(joint) = H(gate) + P(act) * H(target|act) - target only has a second
-        # decision to make when the gate chose to act.
-        entropy = gate_dist.entropy() + gate_dist.probs[:, 1] * target_dist.entropy()
+        # This is NOT H(joint) = H(gate) + P(act)*H(target|act) (the true joint entropy,
+        # which the log_prob above already correctly reflects) - it's only used as train.py's
+        # PPO exploration bonus, and the true-entropy formula is wrong for that purpose.
+        # d[P(act)*H(target)]/dP(act) = H(target) >= 0 unconditionally, so weighting by
+        # P(act) makes "raise P(act)" a free way to harvest more bonus whenever there are
+        # multiple live targets (H(target) > 0) - i.e. almost every tick bordering an
+        # opponent - regardless of whether acting is actually good. That's a standing
+        # gradient pressure toward attacking, fighting directly against the patience this
+        # gate exists to learn. Summing unweighted removes that coupling: each term is
+        # rewarded for its own uncertainty, independent of the other's probability.
+        #
+        # target_dist.entropy() is normalized by its own ceiling (log(num_candidates)) -
+        # a fixed-checkpoint nations=1/2/3 sweep (see CLAUDE.md) confirmed its RAW
+        # magnitude grows ~9.7x from nations=1->3 while candidate count only grows ~2.8x,
+        # and target_entropy/ceiling stays pinned near 0.9-0.99 at every nations count -
+        # i.e. the distribution is consistently ~uniform over however many candidates
+        # exist, not "more confused." Unnormalized, the same ENTROPY_COEF applies an
+        # ever-growing structural push as the curriculum scales to more opponents,
+        # independent of any real change in target-selection confidence. Dividing by the
+        # ceiling makes this term scale-invariant to opponent count instead.
+        num_candidates = real_target_mask.sum(dim=-1).float()
+        target_entropy_ceiling = torch.where(num_candidates > 1, torch.log(num_candidates), torch.ones_like(num_candidates))
+        normalized_target_entropy = target_dist.entropy() / target_entropy_ceiling
+        entropy = gate_dist.entropy() + normalized_target_entropy
 
-        result = (action, log_prob, entropy, self.value_head(hidden))
+        result = (action, log_prob, entropy, self.value_head(torch.cat([hidden, scalar], dim=-1)))
         if return_probs:
-            # flattened back to one probability per original entity - p(do_nothing)
-            # = p(wait), p(candidate j) = p(act) * p(target=j|act) - so callers (e.g.
-            # watch.py's --log-probs) don't need to know the gate exists internally.
+            # p(do_nothing)=p(wait), p(candidate j)=p(act)*p(target=j|act)
             flat_probs = gate_dist.probs[:, 1:2] * target_dist.probs
             flat_probs = torch.where(is_do_nothing, gate_dist.probs[:, 0:1].expand_as(flat_probs), flat_probs)
             result = result + (flat_probs,)
+        if return_entropy_components:
+            # disentangles "gate is less confident" (behavioral) from "target_dist has
+            # more candidates to spread over" (structural - grows with nations count,
+            # independent of gate confidence) - see CLAUDE.md's entropy-scaling hypothesis.
+            # num_candidates lets a caller normalize target_entropy against its own
+            # ceiling (log(num_candidates)) instead of comparing raw values across
+            # different opponent counts. Raw (unnormalized) target_dist.entropy() is
+            # returned here regardless of the normalization applied to `entropy` above,
+            # so this diagnostic keeps measuring the same raw quantity either way.
+            result = result + (gate_dist.entropy(), target_dist.entropy(), num_candidates)
         return result

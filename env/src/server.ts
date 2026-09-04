@@ -14,6 +14,21 @@ import { HarnessSession, reset, step } from "./harness";
 
 const PREFIX = "OFM:";
 
+// Without these, an exception thrown outside handle()'s try/catch (e.g. from a
+// stray promise, a timer callback) kills the process with node's default
+// uncaught-exception handling - which does print a stack trace, but a handler
+// here guarantees it and makes the intent explicit rather than relying on
+// node's default. A signal-killed or natively-crashed process (segfault) still
+// won't hit these - that failure mode has no JS-level hook at all.
+process.on("uncaughtException", (err) => {
+  console.error("[server.ts] uncaughtException:", err.stack ?? err);
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[server.ts] unhandledRejection:", reason);
+  process.exit(1);
+});
+
 function send(obj: unknown): void {
   process.stdout.write(PREFIX + JSON.stringify(obj) + "\n");
 }
@@ -63,6 +78,19 @@ function landBitmap(session: HarnessSession): Uint8Array {
   return bitmap;
 }
 
+// Impassable tiles (mountains/walls) are isLand()===true in the engine but can never
+// be owned or attacked into - GameMap.ts's setWater() explicitly refuses to convert
+// them, so unlike landBitmap this is permanently fixed for a tile and only needs
+// sending once at reset, no tile_updates-stream upkeep required.
+function impassableBitmap(session: HarnessSession): Uint8Array {
+  const map = session.game.map();
+  const bitmap = new Uint8Array(map.width() * map.height());
+  for (let ref = 0; ref < bitmap.length; ref++) {
+    bitmap[ref] = map.isImpassable(ref) ? 1 : 0;
+  }
+  return bitmap;
+}
+
 function toBase64(
   arr: { buffer: ArrayBufferLike; byteOffset: number; byteLength: number } | undefined,
 ): string | null {
@@ -90,11 +118,20 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
 
     session = await reset(seed, map, bots, nations, difficulty);
     const agent = session.game.playerByClientID(session.agentClientID);
+    // agentClientID is a harness-generated constant added to the game synchronously
+    // in reset() - this is only reachable via an engine invariant break (e.g. a
+    // future refactor that stops adding the human player), never a normal outcome.
+    // Throwing surfaces it as a loud cmd_success=false (see the try/catch below,
+    // and bridge.py's matching check) instead of a silent agentSmallID: null that
+    // would corrupt every ownership mask downstream without raising anywhere.
+    if (agent === null) {
+      throw new Error(`agent player not found for clientID ${session.agentClientID}`);
+    }
     send({
       cmd_success: true,
       agentClientID: session.agentClientID,
-      agentSmallID: agent === null ? null : agent.smallID(),
-      agentName: agent === null ? null : agent.name(),
+      agentSmallID: agent.smallID(),
+      agentName: agent.name(),
       tick: session.game.ticks(),
       playersAlive: session.game.players().filter((p) => p.isAlive()).length,
       done: false,
@@ -107,6 +144,7 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       playerTypes: Object.fromEntries(session.game.players().map((p) => [p.smallID(), p.type()])),
       maxTroops: maxTroopsBySmallID(session),
       landBitmap: toBase64(landBitmap(session)),
+      impassableBitmap: toBase64(impassableBitmap(session)),
       totalLand: totalLand(session),
     });
     return;

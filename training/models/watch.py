@@ -1,11 +1,12 @@
 import argparse
+import zlib
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from training.envs.bridge import OpenFrontBridge
-from training.envs.game_state import apply_player_updates, apply_tile_updates, apply_unit_updates, apply_max_troops, apply_land_bitmap
+from training.envs.game_state import EpisodeState, new_masks, apply_reset, apply_step, apply_unit_updates
 from training.envs.map_view import draw_troop_counts, draw_units, outline_agent_territory, render
 from training.envs.observation import encode_observation
 from training.envs.action_space import build_entities, pad_entities, action_to_intents, DO_NOTHING
@@ -18,10 +19,15 @@ def main(
     checkpoint_path: str | Path, seed: str, scale: int, headless: bool = False, diagnostic: bool = False,
     log_probs: bool = False, prob_log_interval: int = 1,
     log_value: bool = False, value_log_interval: int = 1,
+    log_entropy: bool = False, entropy_log_interval: int = 1,
     bots: int = BOTS, nations: int = NATIONS, difficulty: str = DIFFICULTY,
-    max_ticks: int | None = None,
+    max_ticks: int | None = None, map_name: str = "mid_plains",
 ) -> dict | None:
     print(f"using checkpoint: {checkpoint_path}")
+    # env determinism alone isn't enough - get_action_and_value samples from the
+    # global torch RNG, so without this the same seed still gives a different
+    # trajectory (and potentially outcome) on every separate run of this script.
+    torch.manual_seed(zlib.crc32(seed.encode()))
     checkpoint = torch.load(checkpoint_path)
     # frozen, not updated - inference should use exactly the normalization the
     # weights were trained against, not one that keeps adapting mid-game
@@ -31,44 +37,50 @@ def main(
     gold_stats.count = checkpoint["gold_count"]
 
     with OpenFrontBridge() as bridge:
-        setup = bridge.reset(seed=seed, map="mid_plains", bots=bots, nations=nations, difficulty=difficulty)
-        agent_client_id = setup["agentClientID"]
-        agent_small_id = setup["agentSmallID"]
-        agent_name = setup["agentName"]
-        player_types = {int(sid): t for sid, t in setup["playerTypes"].items()}
+        setup = bridge.reset(seed=seed, map=map_name, bots=bots, nations=nations, difficulty=difficulty)
         width, height = setup["width"], setup["height"]
 
-        owner_grid = np.zeros((height, width), dtype=np.uint32)
-        land_mask = np.zeros((height, width), dtype=bool)
-        is_mine = np.zeros((height, width), dtype=bool)
-        is_enemy = np.zeros((height, width), dtype=bool)
-        player_stats: dict = {}
+        owner_grid, land_mask, impassable_mask, is_mine, is_enemy = new_masks(width, height)
         units: dict = {}
-        apply_tile_updates(owner_grid, land_mask, width, setup["packedTileUpdates"], agent_small_id, is_mine, is_enemy)
-        apply_land_bitmap(land_mask, width, setup["landBitmap"])
-        apply_player_updates(player_stats, setup["packedPlayerUpdates"])
-        apply_max_troops(player_stats, setup["maxTroops"])
+        player_stats, agent_small_id, player_types = apply_reset(
+            owner_grid, land_mask, impassable_mask, is_mine, is_enemy, width, setup,
+        )
         apply_unit_updates(units, setup["unitUpdates"])
 
         total_land = setup["totalLand"]
-        spatial, scalar = encode_observation(land_mask, is_mine, is_enemy, player_stats, agent_small_id, total_land)
+        spatial, scalar, ratio_table = encode_observation(land_mask, impassable_mask, is_mine, is_enemy, player_stats, agent_small_id, total_land, owner_grid)
         entity_features, targets = build_entities([], player_stats, player_types, total_land)
         scalar[0] = gold_stats.normalize(scalar[0])
         entity_features[:, 5] = gold_stats.normalize(entity_features[:, 5])
         entities, entity_mask = pad_entities(entity_features)
 
+        episode = EpisodeState(
+            width=width, height=height,
+            owner_grid=owner_grid, land_mask=land_mask, impassable_mask=impassable_mask,
+            is_mine=is_mine, is_enemy=is_enemy, ratio_table=ratio_table, player_stats=player_stats,
+            agent_client_id=setup["agentClientID"], agent_small_id=agent_small_id, agent_name=setup["agentName"],
+            player_types=player_types,
+            spatial=spatial, scalar=scalar, entities=entities, entity_mask=entity_mask, targets=targets,
+        )
+
         agent = Agent.from_observation(spatial, scalar, entities)
-        agent.load_state_dict(checkpoint["model"])
+        # shape mismatches (e.g. entity_dim growing) still raise under strict=False - drop
+        # those keys so they init fresh instead of failing the load, same as train.py
+        own_state = agent.state_dict()
+        saved_state = checkpoint["model"]
+        for k in [k for k, v in saved_state.items() if k in own_state and v.shape != own_state[k].shape]:
+            del saved_state[k]
+        agent.load_state_dict(saved_state, strict=False)
         agent.eval()
 
         if not headless:
             import cv2
 
             cv2.namedWindow("map")
-            img = render(owner_grid, land_mask, agent_small_id, player_types).to_bgr_uint8(scale=scale)
+            img = render(episode.owner_grid, episode.land_mask, episode.agent_small_id, episode.player_types).to_bgr_uint8(scale=scale)
             draw_units(img, units, width, scale)
-            draw_troop_counts(img, owner_grid, land_mask, player_stats, agent_small_id, scale)
-            cv2.imshow("map", outline_agent_territory(img, owner_grid, agent_small_id, scale))
+            draw_troop_counts(img, episode.owner_grid, episode.land_mask, episode.player_stats, episode.agent_small_id, scale)
+            cv2.imshow("map", outline_agent_territory(img, episode.owner_grid, episode.agent_small_id, scale))
             cv2.waitKey(1)
 
         # decision-time troop_ratio/tile_fraction, tracked before stepping - lets us
@@ -92,6 +104,14 @@ def main(
         # the observation). incoming_ratio added alongside outgoing/incoming troops.
         value_samples = []
 
+        # (num_candidates, gate_entropy, target_entropy) - disentangles a less-confident
+        # gate (behavioral) from a target_dist with more candidates to spread probability
+        # over (structural, grows with nations count) - see CLAUDE.md's entropy-scaling
+        # hypothesis. A fixed checkpoint run across nations=1/2/3 isolates the structural
+        # effect: if candidate_count and target_entropy rise together while gate_entropy
+        # stays flat, the hypothesis is confirmed.
+        entropy_samples = []
+
         for i in range(int(1.0e100)):
             with torch.no_grad():
                 result = agent.get_action_and_value(
@@ -101,13 +121,23 @@ def main(
                     entity_mask=torch.from_numpy(entity_mask).unsqueeze(0),
                     action=None,
                     return_probs=log_probs,
+                    return_entropy_components=log_entropy,
                 )
             action, log_prob, entropy, value = result[:4]
             action_idx = action.item()
             target = targets[action_idx] if action_idx < len(targets) else DO_NOTHING
 
+            # positional, not fixed indices - matches policy.py's append order (probs
+            # first if requested, then entropy components), so either flag works alone.
+            extra_idx = 4
             if log_probs:
-                probs = result[4][0]  # (MAX_ENTITIES,)
+                probs = result[extra_idx][0]  # (MAX_ENTITIES,)
+                extra_idx += 1
+            if log_entropy:
+                gate_entropy, target_entropy, num_candidates = (x.item() for x in result[extra_idx:extra_idx + 3])
+                extra_idx += 3
+
+            if log_probs:
                 # do_nothing is always the last row build_entities appends - unless
                 # truncated away by pad_entities when >MAX_ENTITIES candidates existed,
                 # in which case it wasn't a selectable action this tick at all.
@@ -151,6 +181,21 @@ def main(
                         f"tile_fraction={tile_fraction_now:.3f} incoming_ratio={incoming_ratio_now:.3f}"
                     )
 
+            if log_entropy:
+                entropy_samples.append((num_candidates, gate_entropy, target_entropy))
+                if i % entropy_log_interval == 0:
+                    # ceiling = log(num_candidates) - target_entropy's max possible value
+                    # if the distribution were perfectly uniform over that many candidates.
+                    # target_entropy/ceiling near 1.0 across every nations count means the
+                    # rise is purely "more candidates to spread over," not less confidence.
+                    ceiling = np.log(num_candidates) if num_candidates > 1 else float("nan")
+                    ratio_str = "n/a" if np.isnan(ceiling) or ceiling == 0 else f"{target_entropy / ceiling:.3f}"
+                    print(
+                        f"[entropy] tick={i} num_candidates={num_candidates:.0f} "
+                        f"gate_entropy={gate_entropy:.4f} target_entropy={target_entropy:.4f} "
+                        f"target_entropy/ceiling={ratio_str}"
+                    )
+
             if diagnostic:
                 troop_ratio = float(scalar[1])
                 tile_fraction = float(scalar[2])
@@ -166,45 +211,34 @@ def main(
                     peak_tile_fraction = tile_fraction
                     peak_tick = i
 
-            intents = action_to_intents(target=target, agent_client_id=agent_client_id)
+            intents = action_to_intents(target=target, agent_client_id=episode.agent_client_id)
             step_result = bridge.step(intents)
-            attack_mask = step_result["attackMask"]
 
-            apply_tile_updates(
-                owner_grid, land_mask, width, step_result["packedTileUpdates"],
-                agent_small_id, is_mine, is_enemy
-            )
-            apply_player_updates(player_stats, step_result["packedPlayerUpdates"])
-            apply_max_troops(player_stats, step_result["maxTroops"])
+            # apply_step's own eliminated/done check (mirrors train.py's - see its
+            # docstring) covers the same "don't keep observing a dead agent" case this
+            # used to compute locally; done here folds in eliminated the same way.
+            # Mutates episode.spatial/scalar/targets in place - re-read them below.
+            entity_features, _prev_stats, curr_stats, done, _won = apply_step(episode, step_result)
+            spatial, scalar, targets = episode.spatial, episode.scalar, episode.targets
             apply_unit_updates(units, step_result["unitUpdates"])
+            eliminated = curr_stats.get("tilesOwned", 0.0) == 0.0
 
-            # the wider FFA game runs long after our agent is wiped out - train.py
-            # already treats tilesOwned==0 as terminal for this reason (see its
-            # eliminated check); watch.py needs the same or it keeps "observing" a
-            # dead agent whose troops/maxTroops go stale/degenerate.
-            eliminated = player_stats.get(agent_small_id, {}).get("tilesOwned", 0.0) == 0.0
-
-            total_land = step_result["totalLand"]
-            spatial, scalar = encode_observation(
-                land_mask, is_mine, is_enemy, player_stats, agent_small_id, total_land,
-                step_result["outgoingTroops"], step_result["incomingTroops"],
-            )
-            entity_features, targets = build_entities(attack_mask, player_stats, player_types, total_land)
             scalar[0] = gold_stats.normalize(scalar[0])
             entity_features[:, 5] = gold_stats.normalize(entity_features[:, 5])
-            entities, entity_mask = pad_entities(entity_features)
+            episode.entities, episode.entity_mask = pad_entities(entity_features)
+            entities, entity_mask = episode.entities, episode.entity_mask
 
             if not headless and i % 10 == 0:
-                img = render(owner_grid, land_mask, agent_small_id, player_types).to_bgr_uint8(scale=scale)
+                img = render(episode.owner_grid, episode.land_mask, episode.agent_small_id, episode.player_types).to_bgr_uint8(scale=scale)
                 draw_units(img, units, width, scale)
-                draw_troop_counts(img, owner_grid, land_mask, player_stats, agent_small_id, scale)
-                cv2.imshow("map", outline_agent_territory(img, owner_grid, agent_small_id, scale))
+                draw_troop_counts(img, episode.owner_grid, episode.land_mask, episode.player_stats, episode.agent_small_id, scale)
+                cv2.imshow("map", outline_agent_territory(img, episode.owner_grid, episode.agent_small_id, scale))
                 # waitKey also pumps the window's event loop - required for it to
                 # actually repaint, not just a keypress wait.
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
-            if step_result["done"] or eliminated:
+            if done:
                 if eliminated and not step_result["done"]:
                     step_result["winner"] = "eliminated"
                 print("game over, winner:", step_result["winner"])
@@ -243,13 +277,24 @@ def main(
                 if ps:
                     print(f"  troop_ratio [{b/10:.1f},{(b+1)/10:.1f}): n={len(ps):5d} mean_p_do_nothing={sum(ps)/len(ps):.3f}")
 
+        if log_entropy and entropy_samples:
+            candidates, gate_ents, target_ents = (np.array(x) for x in zip(*entropy_samples))
+            ceilings = np.log(np.maximum(candidates, 1))
+            valid = candidates > 1
+            mean_ratio = float((target_ents[valid] / ceilings[valid]).mean()) if valid.any() else float("nan")
+            print(
+                f"[entropy-summary] seed={seed} n={len(entropy_samples)} "
+                f"mean_num_candidates={candidates.mean():.2f} mean_gate_entropy={gate_ents.mean():.4f} "
+                f"mean_target_entropy={target_ents.mean():.4f} mean_target_entropy/ceiling={mean_ratio:.3f}"
+            )
+
         if diagnostic:
             mean_attack_troop_ratio = sum(attack_troop_ratios) / len(attack_troop_ratios) if attack_troop_ratios else None
             summary = {
                 "seed": seed,
                 "final_tick": i,
                 "winner": step_result["winner"],
-                "won": step_result["winner"] == agent_name,
+                "won": step_result["winner"] == episode.agent_name,
                 "do_nothing_ticks": do_nothing_ticks,
                 "attack_ticks": attack_ticks,
                 "first_attack_tick": first_attack_tick,
@@ -283,10 +328,13 @@ if __name__ == "__main__":
     parser.add_argument("--prob-log-interval", type=int, default=1, help="print a [prob] line every N ticks (only with --log-probs)")
     parser.add_argument("--log-value", action="store_true", help="log V(s) per tick plus corr(V,tick)/corr(V,troop_ratio)/corr(V,tile_fraction)")
     parser.add_argument("--value-log-interval", type=int, default=1, help="print a [value] line every N ticks (only with --log-value)")
+    parser.add_argument("--log-entropy", action="store_true", help="log gate_entropy vs target_entropy vs num_candidates per tick - disentangles a less-confident gate from a target_dist that just has more candidates to spread over (structural, scales with nations count)")
+    parser.add_argument("--entropy-log-interval", type=int, default=1, help="print an [entropy] line every N ticks (only with --log-entropy)")
     parser.add_argument("--bots", type=int, default=BOTS, help=f"defaults to train.py's current BOTS ({BOTS}) - keep in sync with what the checkpoint was actually trained against")
     parser.add_argument("--nations", type=int, default=NATIONS, help=f"defaults to train.py's current NATIONS ({NATIONS})")
     parser.add_argument("--difficulty", default=DIFFICULTY, help=f"defaults to train.py's current DIFFICULTY ({DIFFICULTY})")
     parser.add_argument("--max-ticks", type=int, default=None, help="stop early after N ticks - for fast cross-checkpoint probing instead of playing out a full game")
+    parser.add_argument("--map", dest="map_name", default="mid_plains", help="defaults to train.py's current map (mid_plains) - checkpoint wasn't trained on other maps, so results are exploratory")
     args = parser.parse_args()
 
     checkpoint_path = args.checkpoint or latest_checkpoint()
@@ -301,8 +349,9 @@ if __name__ == "__main__":
             headless=args.headless, diagnostic=args.diagnostic,
             log_probs=args.log_probs, prob_log_interval=args.prob_log_interval,
             log_value=args.log_value, value_log_interval=args.value_log_interval,
+            log_entropy=args.log_entropy, entropy_log_interval=args.entropy_log_interval,
             bots=args.bots, nations=args.nations, difficulty=args.difficulty,
-            max_ticks=args.max_ticks,
+            max_ticks=args.max_ticks, map_name=args.map_name,
         ))
 
     if args.diagnostic and len(seeds) > 1:

@@ -664,6 +664,356 @@ alone), it's just cheap enough that overlapping it with PPO's ~9-11s still nets 
 rather than erasing one. Not pursuing a process-based collector for now given the
 thread version already delivers a solid win with much less complexity.
 
+**`STEPS=5000` bump swap-thrashed the machine - `NUM_ENVS` cut 16→8 to fix.**
+`spatial_buf` is `STEPS * NUM_ENVS * 3 * H * W` bytes (bool dtype) - at
+`STEPS=5000, NUM_ENVS=16` on `mid_plains` that's ~21.6GB, and this box is WSL2, which
+caps the VM at 31GB regardless of the 64GB Windows host unless `.wslconfig` overrides
+it. Pushed past available RAM and thrashed swap (disk I/O pinned, page faults in the
+thousands) rather than failing cleanly. `NUM_ENVS=8` (~10.8GB) fixed it; `STEPS` stays
+at 5000 since that's load-bearing for `nations=2` episode completion (see above).
+
+**Multi-enemy representation gap diagnosed and fixed (2026-08-26).** Root cause of
+suspected `nations=2` weakness: `is_enemy` was a single flat bit - every opponent's
+territory looked identical to the CNN regardless of strength, and `owner_grid` (which
+already carries per-tile smallID) was never surfaced beyond that. Fixed:
+- `is_impassable` plane added - `GameMap.isImpassable()` was never sent over the
+  bridge; `isLand()` alone can't distinguish ownable plains from a permanently-blocked
+  wall/mountain, which reads as ordinary neutral land forever. Static per tile
+  (`setWater()` refuses impassable tiles), so it's a one-time `impassableBitmap` dump
+  at reset (`server.ts`), no per-tick upkeep like `land_mask`.
+- `troop_ratio_plane`/`troop_advantage_plane` added (`observation.py`) -
+  `owner_grid`-indexed lookup-array gather (`ratio_by_id[owner_grid]`) scatters each
+  owner's `troops/maxTroops` onto their tiles anonymously (no per-opponent identity/
+  slot, avoids the old `ATTACK_SLOTS` instability class). `troop_advantage_plane` is
+  `agent_ratio - troop_ratio_plane`, bounded to roughly `[-1, 1]` - deliberately not a
+  raw-troop-count ratio (unbounded, reintroduces the "raw count tracks game time" trap
+  `troop_ratio` itself was built to avoid). `spatial` grew 4→6 channels.
+- `Backbone`/`Agent` no longer hardcode the conv input channel count - `spatial_channels`
+  is now sized from a real observation via `Agent.from_observation`, same pattern
+  already used for `scalar_dim`/`entity_dim`. Closes off the "forgot to bump the Conv2d
+  channel count" bug class that hit twice in one session (impassable plane, then the
+  troop planes).
+- **Deferred, not implemented**: `EntityEncoder`'s single-query attention pooling still
+  blends every live opponent into one averaged context vector before the gate/value
+  heads see it - multi-query pooling (a few learned queries instead of one) was
+  designed but deliberately held back until a real `nations=2` run shows the specific
+  blending symptom, rather than stacking an unvalidated architecture change on top of
+  the representation fix and losing the ability to attribute results to either one.
+
+**Refactor: `EpisodeState`/`apply_reset`/`apply_step` shared between `train.py` and
+`watch.py` (`game_state.py`).** `watch.py` had drifted to a different tile/player
+update order than `train.py`'s `collect_rollout` (harmless today since the two updates
+don't read each other's output, but the same drift class already caused real bugs
+here before - the `bots`/`nations` config drift, the missing-elimination-check gap).
+`EpisodeState` moved out of `train.py` into `game_state.py` so both scripts import the
+same type instead of `watch.py` maintaining ~9 loose local variables in parallel;
+`apply_step(episode, step_result)` now does the tile/player-update application +
+observation/entity rebuild in one shared call instead of being duplicated inline in
+both scripts. `training/envs/bridge_test.py` deleted (superseded by `watch.py`, was
+the last caller relying on the optional-`agent_small_id` path in `apply_tile_updates`,
+which is now a required arg).
+
+**`server.ts` now throws instead of silently sending `agentSmallID: null`.**
+`playerByClientID(agentClientID)` returning `null` is structurally unreachable given
+how `reset()` constructs the game (the agent's `PlayerInfo` is added synchronously in
+`GameImpl`'s constructor with a hardcoded clientID) - it was defensive code guarding
+an invariant that can't currently break, but silently propagating `null` would have
+turned a future invariant break into a corrupted-but-not-crashing observation
+(`owners == None` numpy comparisons just evaluate false everywhere) instead of a loud
+error. Matches the project's existing "propagate env-server errors instead of dropping
+them" precedent.
+
+**Two real bugs caught only because a smoke test was run before trusting any of the
+above**, both would have crashed or corrupted the very first real training step:
+- `apply_reset`'s internal call to `apply_tile_updates` wasn't updated after
+  `apply_tile_updates` gained a required `player_stats` first parameter (mid-session,
+  for the troop-ratio-plane work) - `TypeError` on every `reset()`.
+- `build_troop_advantage_plane` was missing its `return` entirely (implicitly
+  returned `None`), and its formula divided raw troop counts rather than comparing
+  two `troops/maxTroops` ratios - fixed to derive from `troop_ratio_plane` instead of
+  re-scanning `player_stats`, so the two planes can't drift out of sync.
+
+**Critical bug, caught after a live training run already looked suspiciously
+cheap on memory: `spatial_buf` (`train.py`) and `SelfImitationBuffer.spatial`
+(`self_imitation.py`) were both hardcoded `dtype=bool`.** Correct when every
+`spatial` plane was truly binary, but `troop_ratio_plane`/`troop_advantage_plane` are
+continuous floats - writing them into a bool array silently truncated every value to
+`0`/`1`, destroying almost all the signal those planes were added for. Worse than a
+missing feature: the live policy saw the real continuous values when picking each
+action, while PPO's log-prob/value recompute during the update trained against the
+truncated version - an actor/learner data mismatch, not just a weaker observation.
+Fixed to `float16` for both (half the cost of `float32`, still exactly lossless for
+the boolean planes). Verified post-fix: `rollout.spatial` dtype is `float16` and
+contains real non-binary values, not just `{0, 1}`.
+
+`spatial_buf` at `float16` with 6 channels is 2x the per-element cost of the old
+3-4-channel `bool` version, so the existing `NUM_ENVS` sizing no longer holds. At
+`STEPS=2000`, `NUM_ENVS=20` (what the corrupted-bool run had been using) computes to
+~40GB for `spatial_buf` alone - would have pushed straight into the same
+swap-thrashing failure mode as the `STEPS=5000/NUM_ENVS=16` incident above, just from
+a different direction (more channels instead of more steps/envs). Cut to `NUM_ENVS=8`
+(~16GB), consistent with that incident's resolution.
+
+**Training restarted on `nations=2` (`NATIONS_MIN=NATIONS_MAX=2`), cold-started,
+after the fixes above.** Not detouring through `nations=1` first: `nations=1` can't
+exercise the new planes at all (no second opponent to disambiguate), so it wouldn't
+validate the thing that changed - see the multi-enemy diagnosis above. The one
+existing checkpoint (`nations=1`, gated-action-head run, only 32 updates in, and
+shape-incompatible with the new 6-channel conv input anyway) archived to
+`checkpoints_pre_multitroopplanes_20260826/`, not deleted.
+
+**`watch.py` diagnostic at update192 (this `nations=2` run): still the same greedy/
+spam-attack failure mode.** 0/5 wins, mean peak tile fraction 0.406. Every game's
+first attack still lands at tick 1-3 (troop_ratio≈0.21, the spawn value) and
+`mean_attack_troop_ratio` is 0.016-0.050 across all 5 seeds - far below the 0.422
+target, unchanged from the pre-shaping-bump diagnostics. One real improvement though:
+`corr(V, troop_ratio)` is now strongly positive in 4/5 seeds (0.45-0.97) - a reversal
+from the earlier "value head learned tick number, not game state" finding. So the
+critic has learned "high troop_ratio is good" but the actor hasn't converted that into
+behavior yet (classic actor-lagging-critic) - `SHAPING_COEF=300` didn't fix it, so the
+bottleneck looks like policy-side credit assignment, not the reward signal's existence
+or magnitude.
+
+**Idea (unimplemented, deliberately deferred): explicit troop-density entity feature.**
+Confirmed the engine's combat resolution genuinely depends on troop density, not just
+raw troop count - `AiAttackBehavior.ts:713`'s `defenderTroopLoss = defender.troops() /
+defender.numTilesOwned()` feeds directly into combat outcomes, and the built-in
+scripted AI already uses this exact density formula (`AiAttackBehavior.ts:447`) to
+pick weak targets. There's also a separate large-territory debuff past 100k tiles
+(`:692-711`, sigmoid-based) independent of density. The agent's current per-entity
+features (`action_space.py`) have `tile_fraction` (`/total_land`) and `troop_ratio`
+(`/maxTroops`) as two separately-normalized values - true density (`troops/
+tilesOwned`) isn't directly derivable from them without reconstructing
+`troop_ratio*maxTroops / (tile_fraction*total_land)`, a nonlinear combination unlikely
+for a small per-entity MLP to discover from reward alone. Real missing signal, not a
+redundant one. Relevant beyond targeting quality too: once `DefensePost`/`City`
+structures land, effective defense-per-tile becomes even more load-bearing, so this is
+worth building as the density feature naturally generalizes to "defended density"
+later. Deliberately held off implementing now (would change `entity_dim`, forcing
+another cold restart) - do alongside the next architecture change rather than
+interrupting the current run.
+
+**Recurring PPO collapse: a real winning streak destabilizes and reverts to ~0% win
+rate.** `watch.py` diagnostics at update192/224 (this `nations=2` run) looked
+identical to a stagnant plateau (0/5 wins both times, same first-attack-tick, same
+low mean_attack_troop_ratio) - but the full per-update log told a different story:
+the policy actually learned real patience and won regularly from update82-186 (many
+updates with 2-7/10-15 episode wins, e.g. update160: 6/8, update164: 7/10), then
+collapsed to ~0 wins for the 50+ updates since. Right before the collapse (updates
+161-187), `kl_stopped` events clustered (`approx_kl` 0.02-0.06, well over
+`TARGET_KL=0.02`) - 6 of 27 updates, vs. almost none before or after. Checkpoint
+weight-distance check (update192 vs 224, 32 updates apart) showed normal ~16%
+relative L2 movement - not a stalled optimizer, a real but unproductive drift.
+Confirmed via `watch.py` that `update160` (archived to
+`checkpoints_prewinstreak_collapse_20260827/`) genuinely plays better (1/5 win,
+`mean_attack_troop_ratio` up to 0.245, peak_tile_fraction 0.807 on the winning seed)
+than `update192`/`224` (0/5, near-zero attack-time troop ratio) - a real regression,
+not noise. This is the same failure class already hit twice before in this project
+(the `update416` lineage that "falls off" whenever PPO fine-tuning resumes on it; the
+`VALUE_COEF` 10x jump's ~300-update entropy collapse) - a winning policy destabilizes
+under continued PPO updates, and once it does, the loss of outcome diversity makes it
+self-sustaining (no more winning trajectories to reinforce recovery).
+
+**Root-cause mechanism (best current understanding):** advantage normalization
+(`(advantages-mean)/std`, global across the rollout) rescales the *overall* magnitude
+but doesn't reshape a heavy-tailed distribution - once real wins mix into mostly-loss
+rollouts, win-episode advantages remain large outliers even after normalization.
+Worse: GAE with `GAE_LAMBDA=0.95` propagates a winning episode's terminal advantage
+backward across nearly its *entire* trajectory, so a single win elevates thousands of
+correlated timesteps at once, and `torch.randperm` spreads those into every minibatch
+that epoch - a shared, correlated push across the whole update, not a rare isolated
+outlier.
+
+**Fix attempt 1: `ADV_CLIP=8.0`** (clamp normalized advantages post-normalization,
+`train.py`). Resumed from `update160`. Same `kl_stopped`/`approx_kl` 0.02-0.03
+pattern recurred within 15-18 updates, win rate reverted to ~0 for the next ~18+
+updates - looked like the same collapse, just faster, though caveat: the original
+collapse only followed a much longer (~100-update) sustained winning stretch, so a
+single good update reverting isn't necessarily proof of the same failure mode acting
+identically. Per-sample clipping alone evidently doesn't stop the *correlated,
+many-samples-at-once* version of the problem.
+
+**Fix attempt 2: `GAE_LAMBDA` 0.95 -> 0.90**, on top of `ADV_CLIP` (both active),
+resumed again from `update160` (the second attempt's collapsed checkpoint archived to
+`checkpoints_postcollapse_20260827/...attempt2.pt`). Delayed the collapse but didn't
+prevent it: win rate sustained ~32 updates (roughly double attempt 1's ~15-18) with
+`mean_reward` frequently positive, then `kl_stopped` at update33 (`approx_kl=0.0215`)
+was followed by 0 wins for the next 7+ updates straight, the same reversion signature
+as both prior attempts. Genuine partial evidence the lambda reduction helps (longer
+sustain), but not a fix on its own.
+
+**Both fixes reverted (`ADV_CLIP` and `GAE_LAMBDA` back to 0.95)** - neither solved
+the collapse outright, so removed rather than left in as unproven clutter. Each
+delayed the failure point (never wins -> ~15-18 updates -> ~32 updates) without
+removing the cause, which is itself a useful data point: the mitigations are treating
+a symptom (single/correlated large-advantage samples) whose underlying trigger is
+still unidentified. Next step is root-causing before trying another mitigation, not
+another parameter-tweak-and-rerun cycle.
+
+**Root cause found and fixed: `SHAPING_COEF=300`'s per-attack penalty, not GAE
+propagation or advantage magnitude.** Instrumented a real rollout
+(`training/models/watch.py`'s underlying loop, hooked to log raw shaping reward vs.
+per-tick troop/maxTroops deltas) on both a winning and a losing seed under `update160`.
+Ruled out the earlier `maxTroops`-denominator-artifact theory outright -
+`corr(|shaping|, |Δmaxtroops|) ≈ -0.01`. What's actually driving every large spike
+(other than the universal tick-0 troop-initialization one): `curr_troops ≈ 0.8 ×
+prev_troops` with `maxTroops` unchanged - exactly `Config.attackAmount()` (20%-of-
+troops per attack), not a bug. Since attacks mostly happen while `troop_ratio` is
+below `TROOP_RATIO_TARGET=0.422` (true for most of the game per every prior
+diagnostic), each one costs `-5.5` to `-5.8` in shaping - over a third of the *entire*
+full-climb-from-spawn shaping total (`~15`), in one tick. A winning episode's
+multi-attack finishing sequence can rack up `-25` to `-50+` this way, fighting
+directly against the `+150` win reward within the same trajectory. Best explanation
+for why this specifically destabilizes once wins appear (frequency of these spikes
+was actually slightly *higher* in a losing-seed control, 2.3% of ticks vs. 1.6%): the
+value function had recently become genuinely troop_ratio-aware (see the
+`corr(V,troop_ratio)` finding above), so in a trajectory trending toward a win, `V(s)`
+already expects a good outcome - the same `-5.5` reward dip is then a *bigger*
+surprise/TD-error against a confident high baseline than the identical dip is in an
+already-low-value losing trajectory the critic doesn't expect much from anyway.
+
+**Fix: soften (don't zero out) the penalty within one attack's grace distance of the
+floor** (`reward.py`'s `_troop_potential`) - flat-zero at/above `TROOP_RATIO_TARGET`
+unchanged, but the deficit produced by exactly one attack
+(`TROOP_RATIO_GRACE = TARGET × ATTACK_COST ≈ 0.0844`) is now scaled to 25% of the full
+quadratic, with the full quadratic resuming (continuous at the boundary) only for
+deficits beyond that - so a single unavoidable attack is much cheaper, but
+compounding/chronic below-floor attacking still escalates. **Tried and reverted a
+second idea first:** a symmetric bonus for banking above `TARGET`, to directly "bias
+toward more than 42%" as requested - potential-based shaping telescopes to zero over
+any round trip (Ng-Harada-Russell), so a bonus for building a buffer is
+mathematically forced to be clawed back in full the instant it's spent. Verified
+numerically before it ever ran: a clean attack from a well-prepared ratio down to
+exactly `TARGET` went from *0 penalty* (already fine under the original formula) to
+**-31.65** with the bonus added - worse than any real spike found, for the best-case
+scenario. There's no free lunch for "reward holding high, don't penalize spending it"
+under a state potential; dropped that half of the idea. Verified the grace-softening
+fix against real logged spikes before trusting it: `tick140` case -5.676 -> -3.362,
+`tick1321` case -5.625 -> -2.938, the well-prepared-buffer case stays exactly 0 (no
+regression), a single clean attack from exactly `TARGET` -2.14 -> -0.534. Aggregate
+effect on a full winning-seed rollout: shaping `std` 0.88 -> 0.64, worst spike -5.68
+-> -3.68. Resumed training from `update160` with this fix alone (both `ADV_CLIP` and
+`GAE_LAMBDA` already reverted) so any effect on the collapse can be attributed to the
+reward fix specifically, not confounded with the earlier PPO-side attempts.
+
+**Reward-shaping fix (grace-softened penalty) tested through update51: did not solve
+the collapse either.** Wins were strong through update11 (mostly 4-6/update,
+`mean_reward` frequently positive), then reverted starting update12 - earlier than
+the `GAE_LAMBDA` attempt's update32, comparable to `ADV_CLIP`-only. Four different,
+individually-verified fixes (cold continuation, `ADV_CLIP`, `GAE_LAMBDA`, and the
+reward redesign) have now all eventually reverted to the same 0-win pattern after a
+`kl_stopped` cluster, at roughly comparable timescales (12-32 updates) - strong signal
+none of these mechanisms is the actual root cause, just things that perturb when it
+hits. Root-causing needs a different angle than another targeted parameter change.
+
+**`MAX_EPISODE_TICKS=10000` episode cap added** (`train.py`, `EpisodeState.ticks` new
+field in `game_state.py`) - a stopgap, not a rigorously-correct time-limit-bootstrap
+implementation. Motivated by a transient memory spike mid-run (35GB used vs. the
+normal ~20GB baseline, self-resolved once long-running episodes finished) - games can
+otherwise run to the engine's own ~170-min hard cap. At the cap, the episode is force-
+ended with `won=False` (so it reads as a loss for reward purposes) rather than
+properly bootstrapping `V(s)` for a true timeout - a known simplification, flagged via
+a `[episode-cap]` print every time it fires so frequency is visible: if these prints
+show up a lot, 10000 is cutting off real games and should be raised (or the timeout
+handling should be done properly instead of approximated as a loss).
+
+**Historical-log analysis (fork, ~62k lines / 1660 update records across 12 runs)
+found 9 independent collapse events predating this session's four fix attempts** -
+spanning 2026-08-24 onward, across at least three different reward/architecture
+configs. This means none of the four mechanisms tried this session (cold
+continuation, `ADV_CLIP`, `GAE_LAMBDA`, reward-shaping softening) was ever likely to
+be sufficient alone - the pattern outlived all of them. Specifically checked and
+**rejected**: entropy collapse right before the break (ranges 0.25-0.43 across all 9
+cases, never near a floor - the policy isn't going deterministic/overconfident).
+**Also found**: `kl_stopped` is a routine, harmless byproduct of any elevated-win-rate
+batch, not a rare acute trigger - one 119-update streak hit it 8 times with no issue,
+and the last occurrence in that run was 27 clean updates before the eventual
+collapse. No pattern found in `policy_loss` sign, `episodes_finished`,`ticks/sec`, or
+`sil_loss` timed to collapse onset. Conclusion: this looks like cumulative,
+path-dependent instability, not a single-update magnitude problem.
+
+**`TARGET_KL`/`kl_stopped` removed entirely** (`train.py`) given the above - it was
+never real protection for this failure mode (only measures divergence on the
+*current* rollout batch, which narrows to the winning-trajectory distribution as win
+rate rises). Per ["RL Forgets! Towards Continual Policy Optimization"](https://arxiv.org/abs/2607.04364):
+"the KL regularization used in common policy optimization methods is evaluated on
+current-task data, whereas forgetting is caused by behavioral drift on prior-task
+distributions" - exactly this project's blind spot. `approx_kl` still computed and
+logged every update, just no longer acted on. Also relevant from the same search:
+PPO's critic can develop "value churn"/misgeneralization as the visited-state
+distribution narrows (general PPO literature), and "as the policy improves, crashes
+happen less frequently, so the agent begins to forget about catastrophic states"
+(self-play collapse literature - mechanism differs, since our opponent is a fixed
+scripted bot not a co-adapting learner, but the narrowing-coverage dynamic
+transfers). Working hypothesis going forward: nothing in the training loop currently
+keeps the network anchored to the broader state distribution (losing/danger states)
+once win rate rises and the on-policy rollout narrows around winning trajectories -
+`SIL_BUFFER` only stores wins, doesn't serve this anchoring purpose. A general
+(non-win-filtered) replay mixed into every PPO update is the leading candidate real
+fix, not yet implemented.
+
+**`SHAPING_COEF` 300 -> 100 tested** (`reward.py`), as a distinct experiment from the
+grace-softening reshape above - that reshaped the curve near the floor and still
+collapsed at update12 (if anything faster than `GAE_LAMBDA`, which didn't touch
+shaping at all), evidence against magnitude being the dominant driver on its own.
+Testing a straight cut to see whether collapse persists at the same rate even with
+shaping much weaker (pointing further toward the structural explanation above) or
+is meaningfully delayed (reopening reward magnitude as a real contributing factor
+after all). Resumed from `update160`, `kl_stopped` already removed. Not yet
+validated.
+
+**Added `value_err_low_ratio`/`value_err_normal`/`frac_low_ratio` diagnostics**
+(`train.py`) - direct test of whether value-function calibration on the rare/low-
+troop-ratio tail degrades relative to the common bucket, rather than inferring it
+from silence in the aggregate `value_loss`. First real result from this run
+(`SHAPING_COEF=100` + `kl_stopped` removed, resumed from `update160`): a genuine
+collapse occurred (wins=0 for 32 updates, 39-70), and the two error curves visibly
+converged right at the transition (ratio ~0.78-0.80 at update 39-41, vs. ~0.5-0.6
+before/after) - the clearest live evidence yet for the mechanism, though the
+"low-ratio bucket specifically gets neglected" framing was too narrow: once
+collapsed, `frac_low_ratio` stayed high (0.72-0.85, low-ratio became the *majority*
+bucket) and `value_err_low_ratio` stayed *smaller* than `value_err_normal`
+throughout, both before and after - no clean flip, just the transient convergence at
+the actual moment of change. Correct framing: whichever bucket is *currently rare*
+in the rollout is the one that goes uncalibrated, and that role can belong to either
+bucket depending on what the policy happens to be doing.
+
+**Self-recovery observed: update71 (14 updates after the deepest point of the
+collapse), sustained through at least update84** - wins returned to a normal 1-6/
+update range, `mean_reward` positive on several updates. Recovered in ~30 updates
+total (39→71), much faster than the one earlier ~300-update precedent. The run was
+killed at update84 before a checkpoint could capture the recovered state (checkpoints
+save every 32; next would have been update96) - lost that specific improvement, but
+confirms recovery-without-intervention is real and can be fast under these settings,
+not just a one-off historical fluke.
+
+**This directly undercuts a proposed fix and pointed at a better one.** A
+"general (non-win-filtered) replay buffer" idea was proposed to keep the value
+function calibrated on rare states - flagged by the user as illogical: the rollout
+during a 30+-update collapse is already almost entirely loss data, so "add more loss
+examples" can't address a scarcity that doesn't exist. Correct conclusion instead:
+since abundant loss data alone doesn't self-correct quickly, the actual problem is
+that continued gradient descent on current data isn't sufficient by itself - pointing
+at either external intervention (rollback-on-detection) or something actively
+fighting recovery, not a data-coverage gap.
+
+**`SIL_MAX_AGE_UPDATES=4` expiration added** (`self_imitation.py`, `train.py`) -
+targets a specific, checkable candidate for "something actively fighting recovery":
+`SIL_BUFFER` only refills from wins, so during a 30+-update collapse it keeps
+replaying increasingly stale pre-collapse transitions against a policy/value function
+that's drifted well away from that distribution - two competing gradient signals
+(fresh on-policy loss vs. stale SIL loss) fighting over the same shared backbone.
+Honest caveat: the observed ~30-update self-recovery happened with SIL active and
+presumably stale the entire time (`sil_buffer=3000`, full, no signs of early
+refresh) - real evidence against SIL being a hard blocker, though it doesn't rule out
+SIL slowing recovery down. `sample()` now returns `None` for a step with nothing
+within `SIL_MAX_AGE_UPDATES` updates old, rather than falling back to stale data;
+`sil_stale_skipped` logged per update for visibility. Smoke-tested the age-cutoff
+logic (samples available through age 3, correctly `None` at age 4+) before trusting
+it. Resumed from `update64` (this run's own latest checkpoint, itself mid-collapse -
+not an ideal baseline for testing recovery speed, but is what "latest" meant at the
+time). Not yet validated.
+
 ## Licensing note
 
 Upstream OpenFrontIO is AGPLv3 (network copyleft — matters only if we run a modified

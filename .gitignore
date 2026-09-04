@@ -6,6 +6,8 @@ __pycache__/
 training/models/checkpoints/
 training/models/checkpoints_*/
 training/logs/
+training/models/logs/
+training/models/train_state.json
 
 # Node
 node_modules/
