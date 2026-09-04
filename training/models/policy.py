@@ -95,6 +95,15 @@ class Agent(nn.Module):
         hidden, _ = self.backbone(spatial, scalar, entities, entity_mask)
         return self.value_head(torch.cat([hidden, scalar], dim=-1))
 
+    def soft_update_from(self, source: "Agent", tau: float) -> None:
+        """Polyak/EMA update toward `source`'s current weights - see CLAUDE.md's
+        target-network fix for the value-bootstrap oscillation. `tau` is the fraction
+        pulled toward source each call (small, e.g. 0.005) so this network moves much
+        slower than `source`'s own gradient descent."""
+        with torch.no_grad():
+            for target_param, source_param in zip(self.parameters(), source.parameters()):
+                target_param.mul_(1 - tau).add_(source_param, alpha=tau)
+
     def get_action_and_value(
         self,
         spatial: torch.Tensor,

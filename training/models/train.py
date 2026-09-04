@@ -219,6 +219,20 @@ PBT_EXPLOIT_GAP = 0.15
 # multiplies the copied member's entropy_scale/lr_scale (not weights) on explore - a
 # random one of these per perturbed hyperparameter, mirroring PBT's usual mutation step.
 PBT_PERTURB_FACTORS = [0.8, 1.2]
+
+# 2026-09-03: EMA target network for GAE's value bootstrap (DQN/DDPG/TD3/SAC-style),
+# motivated by a reproducibility experiment (see CLAUDE.md) - two independent replays
+# from the identical checkpoint, different seeds, both decayed on nearly the same
+# timeline, meaning the recurring oscillation isn't primarily rollout-variance-driven.
+# The live value estimate feeds directly into the very next update's advantage
+# computation with no lag, a classic moving-target instability in TD-style learning.
+# A full copy of backbone+value_head (not just value_head alone - the estimate depends
+# on the shared backbone representation too, which policy gradients also move) is kept
+# and updated via a slow EMA, used only to compute GAE's bootstrap values; the live
+# agent still trains at full speed as before, including its own value_head (used for
+# value_loss's old-value clipping baseline, unchanged). TARGET_TAU is the fraction
+# pulled toward the live agent each update - small, so the target moves much slower.
+TARGET_TAU = 0.01
 # freezes everything but value_head - tests whether V(s) can learn genuine state-
 # awareness against a stable, non-degrading policy, isolated from the self-
 # reinforcing bad-policy/bad-data loop diagnosed this session (see CLAUDE.md).
@@ -319,6 +333,23 @@ def start_episode(bridge, gold_stats: RunningMeanStd) -> EpisodeState:
 def start_all_episodes(vec_bridge: VecOpenFrontBridge, gold_stats: RunningMeanStd) -> list[EpisodeState]:
     """Each slot needs its own random seed to avoid cloning the same game."""
     return list(vec_bridge.executor.map(lambda b: start_episode(b, gold_stats), vec_bridge.bridges))
+
+
+def compute_value_for_episodes(agent, episodes: list[EpisodeState]) -> torch.Tensor:
+    """V(s) for each env's current state - used both for collect_rollout's own bootstrap
+    and (with a target_agent) to compute the target-network bootstrap value in train()."""
+    with torch.no_grad():
+        spatial = np.stack([e.spatial for e in episodes])
+        scalar = np.stack([e.scalar for e in episodes])
+        entities = np.stack([e.entities for e in episodes])
+        entity_mask = np.stack([e.entity_mask for e in episodes])
+        return agent.get_value(
+            spatial=torch.from_numpy(spatial).to(DEVICE),
+            scalar=torch.from_numpy(scalar).to(DEVICE),
+            entities=torch.from_numpy(entities).to(DEVICE),
+            entity_mask=torch.from_numpy(entity_mask).to(DEVICE),
+        ).squeeze(-1).cpu()
+
 
 def collect_rollout(
     vec_bridge: VecOpenFrontBridge,
@@ -438,17 +469,7 @@ def collect_rollout(
                 f"finishing (episode.ticks={episodes[k].ticks}) - buffer may be undersized"
             )
 
-    with torch.no_grad():
-        last_spatial = np.stack([e.spatial for e in episodes])
-        last_scalar = np.stack([e.scalar for e in episodes])
-        last_entities = np.stack([e.entities for e in episodes])
-        last_entity_mask = np.stack([e.entity_mask for e in episodes])
-        last_value = agent.get_value(
-            spatial=torch.from_numpy(last_spatial).to(DEVICE),
-            scalar=torch.from_numpy(last_scalar).to(DEVICE),
-            entities=torch.from_numpy(last_entities).to(DEVICE),
-            entity_mask=torch.from_numpy(last_entity_mask).to(DEVICE),
-        ).squeeze(-1).cpu()
+    last_value = compute_value_for_episodes(agent, episodes)
 
     rollout = Rollout(
         bool_planes=bool_planes_buf,
@@ -477,6 +498,8 @@ def collect_rollout(
 def ppo_update(
     rollout: Rollout,
     agent,
+    target_agent,
+    target_last_value: torch.Tensor,
     optimizer,
     update: int,
     total_train_hours: float,
@@ -503,20 +526,49 @@ def ppo_update(
     rewards = torch.from_numpy(rollout.rewards)
     dones = torch.from_numpy(rollout.dones)
 
+    # target-network values for GAE's bootstrap (see TARGET_TAU above) - a slow-moving
+    # copy of the value-computation path, not the live agent's own just-collected
+    # `values` above (those still seed value_loss's old-value clipping baseline below,
+    # unchanged). Chunked like the PPO epoch loop's minibatches to avoid materializing
+    # the full-rollout float spatial tensor at once (the same memory concern that
+    # motivated per-minibatch reconstruction there).
+    total_ticks = STEPS * rollout.num_envs
+    flat_bool = bool_planes_buf.reshape(total_ticks, *bool_planes_buf.shape[2:])
+    flat_owner = owner_grid_buf.reshape(total_ticks, *owner_grid_buf.shape[2:])
+    flat_ratio = ratio_table_buf.reshape(total_ticks, *ratio_table_buf.shape[2:])
+    flat_scalar = scalar_buf.reshape(total_ticks, *scalar_buf.shape[2:])
+    flat_entities = entities_buf.reshape(total_ticks, *entities_buf.shape[2:])
+    flat_entity_mask = entity_masks.reshape(total_ticks, *entity_masks.shape[2:])
+    flat_target_values = torch.zeros(total_ticks)
+    with torch.no_grad():
+        for start in range(0, total_ticks, MINIBATCH_SIZE):
+            idx = slice(start, start + MINIBATCH_SIZE)
+            chunk_scalar = flat_scalar[idx].to(DEVICE)
+            chunk_spatial = reconstruct_spatial_torch(
+                flat_bool[idx].to(DEVICE), flat_owner[idx].to(DEVICE).long(),
+                flat_ratio[idx].to(DEVICE).float(), chunk_scalar[:, 1],
+            )
+            chunk_value = target_agent.get_value(
+                spatial=chunk_spatial, scalar=chunk_scalar,
+                entities=flat_entities[idx].to(DEVICE), entity_mask=flat_entity_mask[idx].to(DEVICE),
+            )
+            flat_target_values[idx] = chunk_value.squeeze(-1).cpu()
+    target_values = flat_target_values.reshape(STEPS, rollout.num_envs)
+
     running_advantage = torch.zeros(rollout.num_envs)
-    next_value = rollout.last_value
+    next_value = target_last_value
     advantages = torch.zeros(STEPS, rollout.num_envs)
     returns = torch.zeros(STEPS, rollout.num_envs)
 
     for t in reversed(range(STEPS)):
         non_term = 1 - dones[t].float()
 
-        delta = rewards[t] + (GAMMA * next_value * non_term) - values[t]
+        delta = rewards[t] + (GAMMA * next_value * non_term) - target_values[t]
         running_advantage = delta + (GAMMA * GAE_LAMBDA * non_term * running_advantage)
-        next_value = values[t]
+        next_value = target_values[t]
 
         advantages[t] = running_advantage
-        returns[t] = advantages[t] + values[t]
+        returns[t] = advantages[t] + target_values[t]
 
     # raw (pre-normalization) scale, logged below - lets a burst-vs-calm update be
     # compared directly instead of only inferring it from win rate after the fact.
@@ -699,6 +751,7 @@ class Member:
     checkpoint_dir: Path
     vec_bridge: VecOpenFrontBridge
     agent: object
+    target_agent: object
     optimizer: torch.optim.Optimizer
     episodes: list = field(default_factory=list)
     gold_stats: RunningMeanStd = field(default_factory=RunningMeanStd)
@@ -763,10 +816,19 @@ def _load_member(member_id: int, vec_bridge: VecOpenFrontBridge) -> Member:
 
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, agent.parameters()), lr=LR * lr_scale)
 
+    # target network for GAE's value bootstrap (see TARGET_TAU above) - always
+    # (re)started as an exact copy of the just-resumed live agent rather than
+    # separately persisted across restarts; losing a few updates of lag right after
+    # a restart is a negligible cost next to the complexity of persisting a second
+    # full checkpoint's worth of weights.
+    target_agent = Agent.from_observation(episodes[0].spatial, episodes[0].scalar, episodes[0].entities).to(DEVICE)
+    target_agent.load_state_dict(agent.state_dict())
+
     return Member(
-        id=member_id, checkpoint_dir=checkpoint_dir, vec_bridge=vec_bridge, agent=agent, optimizer=optimizer,
-        episodes=episodes, gold_stats=gold_stats, return_stats=return_stats, win_rate_ema=win_rate_ema,
-        entropy_scale=entropy_scale, lr_scale=lr_scale, checkpoint_total_train_hours=checkpoint_total_train_hours,
+        id=member_id, checkpoint_dir=checkpoint_dir, vec_bridge=vec_bridge, agent=agent, target_agent=target_agent,
+        optimizer=optimizer, episodes=episodes, gold_stats=gold_stats, return_stats=return_stats,
+        win_rate_ema=win_rate_ema, entropy_scale=entropy_scale, lr_scale=lr_scale,
+        checkpoint_total_train_hours=checkpoint_total_train_hours,
     )
 
 
@@ -780,6 +842,10 @@ def _pbt_step(members: list[Member], update: int) -> None:
     worst_ema_before_copy = worst.win_rate_ema  # logged below - overwritten right after
 
     worst.agent.load_state_dict(best.agent.state_dict())
+    # sync the target network too - otherwise the just-copied policy would bootstrap
+    # against a stale target left over from its own discarded trajectory, mismatched
+    # with the weights it now actually has.
+    worst.target_agent.load_state_dict(best.target_agent.state_dict())
     worst.win_rate_ema = best.win_rate_ema
     worst.gold_stats.mean, worst.gold_stats.var, worst.gold_stats.count = (
         best.gold_stats.mean, best.gold_stats.var, best.gold_stats.count
@@ -819,14 +885,16 @@ def train():
         for update in range(NUM_UPDATES):
             for m in members:
                 m.episodes, rollout = collect_rollout(m.vec_bridge, m.agent, m.episodes, m.gold_stats)
+                target_last_value = compute_value_for_episodes(m.target_agent, m.episodes)
 
                 current_win_rate = rollout.episode_wins / rollout.episodes_finished if rollout.episodes_finished else m.win_rate_ema
                 m.win_rate_ema = WIN_RATE_EMA_ALPHA * current_win_rate + (1 - WIN_RATE_EMA_ALPHA) * m.win_rate_ema
 
                 episodes_finished, episode_wins, total_train_hours = ppo_update(
-                    rollout, m.agent, m.optimizer, update, total_train_hours, m.return_stats,
-                    entropy_coef_for(m.win_rate_ema) * m.entropy_scale, member_id=m.id,
+                    rollout, m.agent, m.target_agent, target_last_value, m.optimizer, update, total_train_hours,
+                    m.return_stats, entropy_coef_for(m.win_rate_ema) * m.entropy_scale, member_id=m.id,
                 )
+                m.target_agent.soft_update_from(m.agent, TARGET_TAU)
                 save_total_train_hours(total_train_hours)
                 m.total_episodes += episodes_finished
                 m.total_wins += episode_wins
