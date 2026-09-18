@@ -16,6 +16,7 @@ from training.envs.action_space import build_entities, pad_entities, action_to_i
 from training.envs.reward import compute_reward
 from training.envs.running_stats import RunningMeanStd
 from training.models.policy import Agent
+from training.models.anchor_buffer import AnchorBuffer
 
 
 # 2026-08-26: nations=2 games run long - STEPS bumped back to 5000 (horizon-matched via
@@ -91,7 +92,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # against the same codebase without clobbering each other's checkpoints/state file -
 # see the 2026-09-03 crash-reproducibility experiment in CLAUDE.md. Unset in normal use.
 CHECKPOINT_DIR = Path(os.environ.get("OFM_CHECKPOINT_DIR", str(Path(__file__).parent / "checkpoints")))
-CHECKPOINT_INTERVAL = 32
+CHECKPOINT_INTERVAL = 16
 # was 10 (~288 updates of history at this INTERVAL) - too short to bracket a full
 # burst-then-crash cycle (observed spanning ~200-300 updates), so every checkpoint
 # from the last such cycle had already rotated out by the time it was worth
@@ -193,6 +194,42 @@ WIN_RATE_TARGET = 0.45
 def entropy_coef_for(win_rate_ema: float) -> float:
     t = min(win_rate_ema / WIN_RATE_TARGET, 1.0)
     return ENTROPY_COEF_MAX - (ENTROPY_COEF_MAX - ENTROPY_COEF_MIN) * t
+
+
+# 2026-09-07: anchor buffer (see anchor_buffer.py, training/models/) - a targeted
+# self-imitation mechanism built specifically against the "state-visitation narrowing"
+# collapse finding: frac_low_ratio (below) was observed climbing from ~25% to ~85% over
+# exactly the 20 updates of a real collapse, meaning the on-policy rollout stops
+# containing the patient/high-ratio trajectories that actually win - there's nothing
+# left in the data to reinforce recovering to that regime. This buffer keeps a standing
+# library of such states (opposite tail of LOW_RATIO_THRESHOLD) so a small supervised
+# imitation step can keep training against them even during a narrow rollout.
+# threshold set just under the troop-ratio production optimum (0.422, see CLAUDE.md's
+# troopIncreaseRate() derivation) - a state is only "anchor-worthy" if it demonstrates
+# being close to or past that point AND led somewhere good (positive advantage).
+HIGH_RATIO_THRESHOLD = 0.35
+# ~550MB total across both population members at mid_plains resolution (bool_planes
+# dominates: ~351KB/transition) - see the design conversation for the full memory math.
+# Deliberately not persisted in checkpoints yet (starts empty on resume) to keep this
+# change small; a resume losing its anchor library for a while is a minor cost, not a
+# correctness bug.
+ANCHOR_BUFFER_CAPACITY = 500
+# caps how much of one update's rollout can flood the buffer at once, so a single lucky
+# rollout can't dominate the library's diversity.
+ANCHOR_MAX_INSERT_PER_UPDATE = 32
+# loose safety valve, not a correctness requirement like SIL_MAX_AGE_UPDATES was for the
+# old (deleted) self_imitation.py - an anchor here is a supervised (state, action,
+# return) label, not an importance-sampled PPO sample, so it doesn't go stale the same
+# way; this just bounds how long-lived the library gets.
+ANCHOR_MAX_AGE_UPDATES = 300
+ANCHOR_MIN_FILL = 64
+ANCHOR_MINIBATCH_SIZE = 64
+# scales with frac_low_ratio - the same diagnostic that caught the narrowing in the
+# first place - so anti-narrowing pressure ramps up automatically exactly when the
+# rollout is narrowing and fades toward baseline once it's healthy again, instead of
+# needing a separate trigger/threshold to tune.
+ANCHOR_COEF_BASE = 0.02
+ANCHOR_COEF_SCALE = 0.18
 
 
 # 2026-09-02: small population-based training (Jaderberg et al. 2017) layered on top of
@@ -505,6 +542,7 @@ def ppo_update(
     total_train_hours: float,
     return_stats: RunningMeanStd,
     entropy_coef: float,
+    anchor_buffer: AnchorBuffer,
     member_id: int = 0,
 ) -> tuple[int, int, float]:
     # snapshot before any gradient steps this update - compared against the post-update
@@ -574,6 +612,10 @@ def ppo_update(
     # compared directly instead of only inferring it from win rate after the fact.
     raw_advantage_mean = advantages.mean().item()
     raw_advantage_std = advantages.std().item()
+    # captured before the in-place-looking reassignment below overwrites `advantages`
+    # with its normalized form - the anchor buffer selects on raw (unnormalized)
+    # advantage sign, matching the flatten order used further down.
+    raw_advantages_np = advantages.numpy().reshape(-1).copy()
     advantages = (advantages-advantages.mean()) / (advantages.std()+1e-8)
 
     # persistent (not per-update) scale estimate - a rare win's return is 10-20x a
@@ -609,6 +651,15 @@ def ppo_update(
     LOW_RATIO_THRESHOLD = 0.15
     frac_low_ratio = (scalar_buf[:, 1] < LOW_RATIO_THRESHOLD).float().mean().item()
 
+    # anchor buffer fill - see anchor_buffer.py and the ANCHOR_* constants above.
+    anchor_buffer.evict_older_than(update, ANCHOR_MAX_AGE_UPDATES)
+    anchor_inserted = anchor_buffer.insert_from_rollout(
+        bool_planes_buf.numpy(), owner_grid_buf.numpy(), ratio_table_buf.numpy(),
+        scalar_buf.numpy(), entities_buf.numpy(), entity_masks.numpy(),
+        actions.numpy(), raw_advantages_np, returns.numpy(),
+        HIGH_RATIO_THRESHOLD, update, ANCHOR_MAX_INSERT_PER_UPDATE,
+    )
+
     rollout_elapsed = rollout.elapsed
     ppo_start = time.perf_counter()
 
@@ -635,6 +686,8 @@ def ppo_update(
     # comparable update-to-update - not blended with within-update gradient steps.
     low_ratio_err_sum, low_ratio_err_count = 0.0, 0
     normal_err_sum, normal_err_count = 0.0, 0
+    anchor_loss_sum, anchor_steps = 0.0, 0
+    anchor_coef = ANCHOR_COEF_BASE + ANCHOR_COEF_SCALE * frac_low_ratio
     for epoch in range(PPO_EPOCHS):
         epochs_run = epoch + 1
         indices = torch.randperm(total)
@@ -705,6 +758,45 @@ def ppo_update(
             entropy_sum += entropy_bonus.item()
             num_minibatches += 1
 
+        # anchor buffer step - once per epoch (not per minibatch), see anchor_buffer.py
+        # and the ANCHOR_* constants above. Self-imitation (Oh et al. 2018) form, not
+        # PPO's importance-sampled objective - see module docstring for why.
+        anchor_batch = anchor_buffer.sample(ANCHOR_MINIBATCH_SIZE) if len(anchor_buffer) >= ANCHOR_MIN_FILL else None
+        if anchor_batch is not None:
+            a_scalar = torch.from_numpy(anchor_batch["scalar"]).to(DEVICE)
+            a_spatial = reconstruct_spatial_torch(
+                torch.from_numpy(anchor_batch["bool_planes"]).to(DEVICE),
+                torch.from_numpy(anchor_batch["owner_grid"]).to(DEVICE).long(),
+                torch.from_numpy(anchor_batch["ratio_table"]).to(DEVICE).float(),
+                a_scalar[:, 1],
+            )
+            a_entities = torch.from_numpy(anchor_batch["entities"]).to(DEVICE)
+            a_entity_mask = torch.from_numpy(anchor_batch["entity_mask"]).to(DEVICE)
+            a_action = torch.from_numpy(anchor_batch["action"]).to(DEVICE)
+            a_return = torch.from_numpy(anchor_batch["ret"]).to(DEVICE)
+
+            _, a_log_prob, _, a_value = agent.get_action_and_value(
+                spatial=a_spatial, scalar=a_scalar, entities=a_entities, entity_mask=a_entity_mask,
+                action=a_action,
+            )
+            a_value = a_value.squeeze(-1)
+            # weight is detached - only the log_prob/value regression get gradient, not
+            # the advantage-like weight itself (standard SIL form).
+            with torch.no_grad():
+                weight = torch.clamp(a_return - a_value, min=0.0)
+            policy_term = -(weight * a_log_prob).mean()
+            # only pushes value UP toward a demonstrated good return, never down - can't
+            # fight the main value loss on states it's already right about.
+            value_term = 0.5 * torch.clamp(a_return - a_value, min=0.0).square().mean()
+            anchor_loss = anchor_coef * (policy_term + VALUE_COEF * value_term)
+
+            optimizer.zero_grad()
+            anchor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+            optimizer.step()
+            anchor_loss_sum += anchor_loss.item()
+            anchor_steps += 1
+
     mean_gold_at_win = (
         sum(rollout.episode_end_golds_win) / len(rollout.episode_end_golds_win) if rollout.episode_end_golds_win else 0.0
     )
@@ -736,6 +828,8 @@ def ppo_update(
         f"frac_low_ratio={frac_low_ratio:.4f} "
         f"value_err_low_ratio={low_ratio_err_sum / max(low_ratio_err_count, 1):.4f}(n={low_ratio_err_count}) "
         f"value_err_normal={normal_err_sum / max(normal_err_count, 1):.4f}(n={normal_err_count}) "
+        f"anchor_buffer_size={len(anchor_buffer)} anchor_inserted={anchor_inserted} "
+        f"anchor_coef={anchor_coef:.4f} anchor_loss={anchor_loss_sum / max(anchor_steps, 1):.4f} "
         f"raw_adv_mean={raw_advantage_mean:.4f} raw_adv_std={raw_advantage_std:.4f} "
         f"weight_delta_l2={weight_delta_l2:.4f} entropy_coef={entropy_coef:.4f} "
         f"time={total_elapsed:.1f}s (rollout={rollout_elapsed:.1f}s ppo={ppo_elapsed:.1f}s) "
@@ -756,6 +850,7 @@ class Member:
     episodes: list = field(default_factory=list)
     gold_stats: RunningMeanStd = field(default_factory=RunningMeanStd)
     return_stats: RunningMeanStd = field(default_factory=RunningMeanStd)
+    anchor_buffer: AnchorBuffer = field(default_factory=lambda: AnchorBuffer(ANCHOR_BUFFER_CAPACITY))
     win_rate_ema: float = 0.0
     entropy_scale: float = 1.0
     lr_scale: float = 1.0
@@ -892,7 +987,8 @@ def train():
 
                 episodes_finished, episode_wins, total_train_hours = ppo_update(
                     rollout, m.agent, m.target_agent, target_last_value, m.optimizer, update, total_train_hours,
-                    m.return_stats, entropy_coef_for(m.win_rate_ema) * m.entropy_scale, member_id=m.id,
+                    m.return_stats, entropy_coef_for(m.win_rate_ema) * m.entropy_scale, m.anchor_buffer,
+                    member_id=m.id,
                 )
                 m.target_agent.soft_update_from(m.agent, TARGET_TAU)
                 save_total_train_hours(total_train_hours)
