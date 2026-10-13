@@ -12,7 +12,9 @@ def build_ratio_table(player_stats: dict) -> np.ndarray:
     (H, W) gather materializes, at a tiny fraction of the storage."""
     ratio_by_id = np.zeros(MAX_SMALL_ID, dtype=np.float32)
     for sid, stats in player_stats.items():
-        ratio_by_id[sid] = stats.get("troops", 0.0) / max(stats.get("maxTroops", 0.0), 1)
+        max_troops = stats.get("maxTroops", 0.0)
+        if max_troops > 0:
+            ratio_by_id[sid] = stats.get("troops", 0.0) / max_troops
     return ratio_by_id
 
 
@@ -37,10 +39,13 @@ def build_troop_advantage_plane(agent_small_id: int, ratio_table: np.ndarray, tr
 
 def reconstruct_spatial_torch(
     bool_planes: torch.Tensor, owner_grid: torch.Tensor, ratio_table: torch.Tensor, agent_ratio: torch.Tensor,
+    static_planes: torch.Tensor,
 ) -> torch.Tensor:
     """Rebuilds the (B, 6, H, W) float spatial tensor the network trains against from
-    the compressed rollout-buffer representation - bool_planes (B, 4, H, W) bool,
-    owner_grid (B, H, W) long, ratio_table (B, MAX_SMALL_ID) float, agent_ratio (B,)
+    the compressed rollout-buffer representation - bool_planes (B, 2, H, W) bool
+    [is_mine, is_enemy], static_planes (2, H, W) bool [is_land, is_impassable] shared
+    by the whole batch (assumes land/impassable never change mid-episode and the map
+    is constant - not true with water nukes), owner_grid (B, H, W) long, ratio_table (B, MAX_SMALL_ID) float, agent_ratio (B,)
     float (the agent's own troop_ratio, scalar index 1 - see encode_observation).
     Exact, not an approximation: owner_grid -> ratio_table is the same dictionary
     lookup build_troop_ratio_plane does at collection time, just deferred to just
@@ -51,8 +56,9 @@ def reconstruct_spatial_torch(
     b, h, w = owner_grid.shape
     troop_ratio_plane = torch.gather(ratio_table, 1, owner_grid.reshape(b, h * w)).reshape(b, h, w)
     troop_advantage_plane = agent_ratio.view(b, 1, 1) - troop_ratio_plane
+    static = static_planes.float().unsqueeze(0).expand(b, -1, -1, -1)
     return torch.cat([
-        bool_planes.float(), troop_ratio_plane.unsqueeze(1), troop_advantage_plane.unsqueeze(1),
+        static, bool_planes.float(), troop_ratio_plane.unsqueeze(1), troop_advantage_plane.unsqueeze(1),
     ], dim=1)
 
 

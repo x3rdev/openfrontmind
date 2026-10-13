@@ -1014,6 +1014,15 @@ it. Resumed from `update64` (this run's own latest checkpoint, itself mid-collap
 not an ideal baseline for testing recovery speed, but is what "latest" meant at the
 time). Not yet validated.
 
+**Rollout buffer: `is_land`/`is_impassable` stored once per rollout, not per tick**
+(`Rollout.static_planes`, `reconstruct_spatial_torch`). Per-tick bool planes 4→2
+(`is_mine`, `is_enemy`), 6→4 bytes/px overall, anchor/low-ratio buffers shrink too.
+Verified bit-exact against `encode_observation` on synthetic input, then run
+through 100+ live PPO updates. `del rollout` after each member's update drops peak
+RSS 31→12GB at 4 envs; `NUM_ENVS_PER_MEMBER` now 10 (~26GB, ~440 ticks/s). **Assumes land never changes mid-episode and the map is constant - will
+break with water nukes** (the live actor sees the updated `land_mask`, PPO recompute
+would see the stale one).
+
 ## Licensing note
 
 Upstream OpenFrontIO is AGPLv3 (network copyleft — matters only if we run a modified

@@ -82,11 +82,47 @@ class AnchorBuffer:
         scalar_buf: np.ndarray, entities_buf: np.ndarray, entity_mask_buf: np.ndarray,
         actions: np.ndarray, raw_advantages: np.ndarray, returns: np.ndarray,
         high_ratio_threshold: float, update: int, max_insertions: int,
+        high_ratio_ceiling: float = float("inf"),
     ) -> int:
-        """Selects candidate timesteps (troop_ratio >= threshold, positive raw advantage)
-        from one flattened rollout and inserts a capped random subsample - see module
-        docstring. Returns the number actually inserted, for logging."""
-        candidates = np.nonzero((scalar_buf[:, 1] >= high_ratio_threshold) & (raw_advantages > 0))[0]
+        """Selects candidate timesteps (threshold <= troop_ratio <= ceiling, positive raw
+        advantage) from one flattened rollout and inserts a capped random subsample - see
+        module docstring. Returns the number actually inserted, for logging.
+
+        high_ratio_ceiling (2026-10-10): without an upper bound, this buffer's own
+        self-imitation pull has no way to tell "waited a healthy amount" from "waited
+        way past the point of diminishing returns" - whatever ratio the live policy's
+        good outcomes happen to cluster at gets reinforced as more buffer entries,
+        pushing the next policy to wait even longer for its own good outcomes, a
+        ratchet with no ceiling. Bounding insertion to a band around TROOP_RATIO_TARGET
+        stops the buffer from rewarding arbitrarily long delays."""
+        candidates = np.nonzero(
+            (scalar_buf[:, 1] >= high_ratio_threshold) & (scalar_buf[:, 1] <= high_ratio_ceiling)
+            & (raw_advantages > 0)
+        )[0]
+        if candidates.size == 0:
+            return 0
+        if candidates.size > max_insertions:
+            candidates = np.array(random.sample(list(candidates), max_insertions))
+        for i in candidates:
+            self.insert(
+                bool_planes_buf[i], owner_grid_buf[i], ratio_table_buf[i],
+                scalar_buf[i], entities_buf[i], entity_mask_buf[i],
+                actions[i], returns[i], update,
+            )
+        return int(candidates.size)
+
+    def insert_low_ratio_from_rollout(
+        self,
+        bool_planes_buf: np.ndarray, owner_grid_buf: np.ndarray, ratio_table_buf: np.ndarray,
+        scalar_buf: np.ndarray, entities_buf: np.ndarray, entity_mask_buf: np.ndarray,
+        actions: np.ndarray, returns: np.ndarray,
+        low_ratio_threshold: float, update: int, max_insertions: int,
+    ) -> int:
+        """Selects candidate timesteps (troop_ratio < threshold) regardless of outcome
+        or advantage sign - keeps the value head calibrated on this tail even once a
+        winning streak makes it rare in the live rollout (see CLAUDE.md's value-
+        calibration-narrowing finding). Otherwise identical to insert_from_rollout."""
+        candidates = np.nonzero(scalar_buf[:, 1] < low_ratio_threshold)[0]
         if candidates.size == 0:
             return 0
         if candidates.size > max_insertions:

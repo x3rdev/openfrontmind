@@ -2,6 +2,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import copy
 import json
 import os
 import random
@@ -74,6 +75,22 @@ BOTS = 0
 # same reasoning as the earlier nations=1->2 bump: nations=2 is solved enough to move on,
 # and re-proving nations=2 further wouldn't validate anything new. Milestone preserved at
 # checkpoints_milestones/agent_20260901_233001_update64_nations2_winrate83pct.pt.
+# 2026-10-05: nations=1 fully re-validated and the root cause of the long-standing
+# collapse found and fixed (see CLAUDE.md) - rollout collection decoupled from the EMA
+# target_agent (was ~100-update-lag damped, masking all behavioral progress) and
+# entropy_coef fixed at a low constant (0.02) instead of the win-rate-adaptive scheme
+# (which pinned near its ceiling for the entire stuck period, a deadlock not a windup).
+# Result: both PBT members sustained 80-94% win rate for 650+ updates with only one
+# self-corrected dip, confirmed independently via a clean 15/15-seed holdout eval.
+# Milestone preserved at
+# checkpoints_milestones/agent_20261005_183447_update1664_nations1_winrate87pct.pt.
+# Bumping to nations=3 (not nations=2 - no reason to re-prove the intermediate step
+# given how cleanly nations=1 resolved) warm-started from that checkpoint, same
+# reasoning as every earlier curriculum bump: the entity encoder is permutation-
+# invariant to candidate count, so no architecture change is needed to add opponents.
+# 2026-10-11: nations=3 held 68-85% for 100+ updates on both members after the
+# from_default restart; bumping to 4, warm-started from its update128 checkpoint.
+# 2026-10-12: back to 3 - n4-only sat at ~0% wins for 300+ updates and eroded the policy.
 NATIONS_MIN = 3
 NATIONS_MAX = 3
 NATIONS = NATIONS_MAX  # single-value fallback for watch.py's default
@@ -88,23 +105,45 @@ SEED_POOL: list[str] = []
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# overridable via env var so multiple isolated repro runs can execute in parallel
-# against the same codebase without clobbering each other's checkpoints/state file -
-# see the 2026-09-03 crash-reproducibility experiment in CLAUDE.md. Unset in normal use.
-CHECKPOINT_DIR = Path(os.environ.get("OFM_CHECKPOINT_DIR", str(Path(__file__).parent / "checkpoints")))
+# 2026-10-01: 3-way ablation to actually isolate the root cause of the long-run win-rate
+# decline, instead of inferring mechanism from log correlation alone (see CLAUDE.md -
+# the entropy rate-limit fix didn't stop a decline with entropy_coef barely moving,
+# disproving the "entropy windup is the dominant driver" theory as stated). Controlled
+# via env var so the three variants run as separate processes against the same
+# codebase: "control" = current code unchanged, "fixed_entropy" = entropy_coef held at
+# a flat constant (adaptation fully disabled, not just rate-limited), "no_anchor" =
+# anchor loss fully disabled (self-imitation removed). Each isolates one mechanism;
+# if the decline still happens in a variant with that mechanism off, it's not the
+# (sole) cause.
+OFM_ABLATION = os.environ.get("OFM_ABLATION", "control")
+assert OFM_ABLATION in ("control", "fixed_entropy", "no_anchor"), f"unknown OFM_ABLATION={OFM_ABLATION!r}"
+FIXED_ENTROPY_COEF = float(os.environ.get("OFM_FIXED_ENTROPY_COEF", "0.08"))
+
+# 2026-10-06: runtime artifacts (checkpoints/logs/state) live under a top-level runs/
+# directory, not inside training/models/ alongside source - keeps the source tree
+# free of the growing pile of per-experiment output directories. OFM_RUN_NAME is the
+# one knob for isolated parallel runs (see the 2026-09-03 crash-reproducibility
+# experiment in CLAUDE.md for why that matters); OFM_CHECKPOINT_DIR/OFM_TRAIN_STATE_PATH
+# below still override directly if a run needs a path outside runs/ entirely.
+RUNS_DIR = Path(os.environ.get("OFM_RUNS_DIR", str(Path(__file__).parent.parent.parent / "runs")))
+RUN_NAME = os.environ.get("OFM_RUN_NAME", "default")
+CHECKPOINT_DIR = Path(os.environ.get("OFM_CHECKPOINT_DIR", str(RUNS_DIR / "checkpoints" / RUN_NAME)))
 CHECKPOINT_INTERVAL = 16
 # was 10 (~288 updates of history at this INTERVAL) - too short to bracket a full
 # burst-then-crash cycle (observed spanning ~200-300 updates), so every checkpoint
 # from the last such cycle had already rotated out by the time it was worth
-# investigating. 50 covers ~1568 updates at ~9MB/checkpoint (~450MB total) - trivial
-# disk cost for keeping enough history to actually do that analysis next time.
-CHECKPOINT_KEEP = 50
+# investigating. 2026-10-01: hit this exact failure again - a declining run was left
+# checkpointing for 400+ more updates past its own healthy peak, well past 50 updates'
+# worth, and by the time the decline was confirmed real the peak checkpoint was gone
+# from disk entirely, forcing a cold restart instead of a rollback. 50 was not enough
+# margin in practice. Bumped to 200 (~1.8GB/member at ~9MB/checkpoint - still trivial).
+CHECKPOINT_KEEP = 200
 
 # Lives outside CHECKPOINT_DIR on purpose - archiving/clearing checkpoints/ for a cold
 # restart (weights reset) should never also reset this. total_train_hours is real elapsed
 # wall-clock compute, not a property of the current weights; it was silently reset twice
 # (2026-08-25) because it previously only lived inside the checkpoint dict.
-TRAIN_STATE_PATH = Path(os.environ.get("OFM_TRAIN_STATE_PATH", str(Path(__file__).parent / "train_state.json")))
+TRAIN_STATE_PATH = Path(os.environ.get("OFM_TRAIN_STATE_PATH", str(RUNS_DIR / "state" / f"{RUN_NAME}.json")))
 
 
 def load_total_train_hours() -> float:
@@ -121,12 +160,18 @@ def save_checkpoint(
     checkpoint_dir: Path,
     agent, update: int, gold_stats: RunningMeanStd, return_stats: RunningMeanStd, total_train_hours: float,
     win_rate_ema: float, entropy_scale: float = 1.0, lr_scale: float = 1.0,
+    optimizer: torch.optim.Optimizer | None = None, entropy_coef_current: float | None = None,
 ) -> Path:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     path = checkpoint_dir / f"agent_{time.strftime('%Y%m%d_%H%M%S')}_update{update}.pt"
     # gold_stats/return_stats/win_rate_ema/entropy_scale/lr_scale travel with the weights
     # so a resume normalizes/adapts consistently instead of resetting to defaults and
     # spiking ENTROPY_COEF back to max (or losing a PBT-inherited perturbation) on restart.
+    # 2026-09-24: optimizer state (Adam's per-parameter momentum/variance) now travels
+    # too - a resume used to always build a fresh optimizer, which the checkpoint-sweep
+    # diagnostic linked to sharp behavioral regressions in the first ~64 updates after
+    # every restart (see LR_WARMUP_UPDATES above, which stays as a fallback for when
+    # this key is absent or unusable, e.g. an old checkpoint or a shape change).
     torch.save(
         {
             "model": agent.state_dict(),
@@ -140,6 +185,8 @@ def save_checkpoint(
             "win_rate_ema": win_rate_ema,
             "entropy_scale": entropy_scale,
             "lr_scale": lr_scale,
+            "entropy_coef_current": entropy_coef_current,
+            "optimizer": optimizer.state_dict() if optimizer is not None else None,
         },
         path,
     )
@@ -156,6 +203,16 @@ def latest_checkpoint(checkpoint_dir: Path = CHECKPOINT_DIR) -> Path | None:
     return checkpoints[-1] if checkpoints else None
 
 LR = 1e-4
+# 2026-09-23: a fresh Adam optimizer (zero momentum/variance estimates) applied at
+# full LR to an already-converged network - every resume and every PBT exploit builds
+# one from scratch, see _load_member/_pbt_step - is a plausible trigger for the sharp,
+# near-immediate behavioral regressions observed right after several restarts this
+# session (see CLAUDE.md's checkpoint-sweep finding: mean_attack_troop_ratio and
+# first_attack_troop_ratio both collapsed within ~64 updates of a resume). Ramp LR
+# linearly over this many updates after any optimizer reset instead of applying it at
+# full strength immediately, so Adam's own statistics have a chance to calibrate to the
+# existing loss landscape first.
+LR_WARMUP_UPDATES = 16
 # derived from STEPS, not a separate literal - GAE's effective horizon is 1/(1-GAMMA), and
 # a hand-set GAMMA silently drifting out of sync with STEPS (e.g. STEPS bumped for longer
 # games, GAMMA left at the old value) was a real bug that went unnoticed for the whole
@@ -189,6 +246,19 @@ WIN_RATE_EMA_ALPHA = 0.1
 # chosen below the ~59% peak seen this session so it can actually engage before a
 # streak's typical decay point, not just at an already-rare best case.
 WIN_RATE_TARGET = 0.45
+# 2026-09-30: rate-limit how fast entropy_coef can move toward entropy_coef_for()'s
+# target - a root-cause investigation (literature + code audit, see CLAUDE.md) found
+# this scheme is textbook integral windup: real SAC's automatic temperature tuning
+# targets a FIXED entropy value (self-limiting - the correction goes to zero once
+# reached), but this scheme instead reacts to a lagging, noisy, DOWNSTREAM proxy
+# (win_rate_ema) that entropy itself can move. Confirmed mechanistically: the entropy
+# bonus includes gate_dist.entropy() (policy.py) - raising entropy_coef pushes the
+# wait-vs-attack gate toward 50/50, which directly increases premature attacks
+# (frac_low_ratio), which lowers win_rate_ema, which raises entropy_coef further. A
+# 512-update run showed both climbing in lockstep with no recovery. Rate-limiting is
+# the standard anti-windup fix - it can still track a real, sustained trend, but can't
+# snap to ENTROPY_COEF_MAX chasing every noisy dip in win rate.
+ENTROPY_COEF_MAX_STEP = 0.002
 
 
 def entropy_coef_for(win_rate_ema: float) -> float:
@@ -208,6 +278,15 @@ def entropy_coef_for(win_rate_ema: float) -> float:
 # troopIncreaseRate() derivation) - a state is only "anchor-worthy" if it demonstrates
 # being close to or past that point AND led somewhere good (positive advantage).
 HIGH_RATIO_THRESHOLD = 0.35
+# 2026-10-10: ceiling added - see anchor_buffer.py's insert_from_rollout docstring.
+# first_attack_troop_ratio drifted 0.69 -> 0.90 -> 0.75-0.83 across this session's
+# experiments despite TROOP_RATIO_TARGET staying at 0.422 the whole time - the anchor
+# buffer had no upper bound, so whatever ratio the live policy's good outcomes
+# happened to cluster at kept getting reinforced as the next "good" example,
+# ratcheting the target upward with nothing to pull it back down. Capped to roughly
+# [target, target+2x the single-attack grace distance] so a real margin above target
+# is still anchor-worthy, but waiting indefinitely isn't.
+HIGH_RATIO_CEILING = 0.60
 # ~550MB total across both population members at mid_plains resolution (bool_planes
 # dominates: ~351KB/transition) - see the design conversation for the full memory math.
 # Deliberately not persisted in checkpoints yet (starts empty on resume) to keep this
@@ -224,12 +303,39 @@ ANCHOR_MAX_INSERT_PER_UPDATE = 32
 ANCHOR_MAX_AGE_UPDATES = 300
 ANCHOR_MIN_FILL = 64
 ANCHOR_MINIBATCH_SIZE = 64
-# scales with frac_low_ratio - the same diagnostic that caught the narrowing in the
-# first place - so anti-narrowing pressure ramps up automatically exactly when the
-# rollout is narrowing and fades toward baseline once it's healthy again, instead of
-# needing a separate trigger/threshold to tune.
-ANCHOR_COEF_BASE = 0.02
-ANCHOR_COEF_SCALE = 0.18
+# 2026-09-30: fixed, no longer scales with frac_low_ratio. It used to
+# (ANCHOR_COEF_BASE + ANCHOR_COEF_SCALE*frac_low_ratio) on the theory that
+# anti-narrowing pressure should ramp up automatically exactly when the rollout is
+# narrowing - but a root-cause investigation found this was a second, uncoordinated
+# controller reacting to the same underlying signal family as entropy_coef (both
+# ultimately driven by declining win rate), and the two were compounding into a
+# runaway feedback loop rather than correcting independently (see CLAUDE.md and
+# ENTROPY_COEF_MAX_STEP above). Fixed at the old base value - matches what it already
+# sat near during every healthy stretch of training (frac_low_ratio 0.02-0.06), so
+# this removes the harmful amplification during bad stretches without changing
+# behavior during good ones.
+ANCHOR_COEF = 0.02
+
+# 2026-10-10: low-ratio value-calibration buffer - the complementary tail to the
+# anchor buffer above. A high win rate doesn't make the weights unstable by itself;
+# it narrows the live rollout toward wins, so the value head stops seeing enough
+# low-ratio/loss states to stay calibrated there. When a loss does occur, its
+# advantage is computed against a badly-miscalibrated baseline, producing an
+# oversized, poorly-targeted policy gradient - the actual mechanism behind this
+# project's long-documented "a real winning streak destabilizes" collapses (see
+# CLAUDE.md). Fix: a ring buffer of (state, return) pairs sampled from ANY low-ratio
+# timestep (not gated on outcome/advantage like the anchor buffer - we want this
+# tail covered regardless of whether it was a good or bad state) that keeps training
+# the value head via plain regression every update, so it can't go stale just
+# because the live rollout stops visiting it. Value-only, no policy/self-imitation
+# term - imitating actions taken in bad states isn't the goal, keeping V(s) honest
+# there is.
+LOW_RATIO_BUFFER_CAPACITY = 500
+LOW_RATIO_MAX_INSERT_PER_UPDATE = 32
+LOW_RATIO_MAX_AGE_UPDATES = 300
+LOW_RATIO_MIN_FILL = 64
+LOW_RATIO_MINIBATCH_SIZE = 64
+LOW_RATIO_COEF = 0.02
 
 
 # 2026-09-02: small population-based training (Jaderberg et al. 2017) layered on top of
@@ -247,7 +353,22 @@ ANCHOR_COEF_SCALE = 0.18
 # POP_SIZE=1 (single lineage, PBT's exploit/explore trivially no-ops with one member)
 # to isolate whether a crash reproduces without PBT's own dynamics as a confound.
 POP_SIZE = int(os.environ.get("OFM_POP_SIZE", "2"))
-NUM_ENVS_PER_MEMBER = 2
+# 2026-10-07: measured real peak RSS (not just buffer math, which underestimated this
+# badly - it only accounted for the rollout buffers' own growth, missing that the PPO
+# phase's minibatch tensors also scale with total data collected) across three
+# settings: =2 peaks ~19.5GB used (~20GB headroom); =3 peaks ~25.7GB used (~14.5GB
+# headroom, confirmed across 4 full cycles); =4 peaks ~32.4GB used (~7.7GB headroom -
+# thin given this box's history of swap-thrashing crashes near that line, but accepted
+# deliberately for the extra throughput: ~295 ticks/sec vs =3's ~250 and =2's ~220).
+# Set back to 4 on explicit instruction after seeing the =3 numbers - watch memory
+# closely at this setting; drop back to 3 if headroom looks tighter than this single
+# profile run suggests. The two PBT members' peaks are temporally separated already
+# (collect_rollout/ppo_update run strictly sequentially per member in train()'s loop,
+# never concurrently - no threading wired in) so sizing only needs to cover one
+# member's peak, not both at once.
+# 2026-10-12: 4->10 after the static-planes + del-rollout memory cuts: peak RSS 26GB
+# at 10 (vs 31GB at 4 before), ~440 vs ~300 ticks/s. 12 would land near 31GB.
+NUM_ENVS_PER_MEMBER = int(os.environ.get("OFM_NUM_ENVS_PER_MEMBER", "10"))
 # matches CHECKPOINT_INTERVAL's cadence - no strong reason for a different period yet.
 PBT_INTERVAL = 32
 # win_rate_ema gap (0-1 scale) that triggers an exploit/explore step - deliberately large
@@ -269,7 +390,39 @@ PBT_PERTURB_FACTORS = [0.8, 1.2]
 # agent still trains at full speed as before, including its own value_head (used for
 # value_loss's old-value clipping baseline, unchanged). TARGET_TAU is the fraction
 # pulled toward the live agent each update - small, so the target moves much slower.
-TARGET_TAU = 0.01
+#
+# 2026-09-27: target_agent also now drives rollout collection (see train()), not just
+# GAE's value bootstrap - a root-cause investigation of a recurring win-rate collapse
+# (real winning streaks destabilizing back to ~0%, see CLAUDE.md's long history of this)
+# found that gradient clipping (clip_grad_norm_ below, already active) doesn't prevent
+# it: clipping bounds each of the ~200 minibatch steps within one PPO update
+# individually, but does nothing to stop many of them - correlated by design, since a
+# single winning episode's GAE advantage propagates across nearly its whole trajectory
+# and torch.randperm spreads those correlated samples into every minibatch that epoch -
+# from summing to a large net weight_delta_l2 in one update (observed: 4.33 vs. a
+# typical 2.7-3.6, landing exactly on the update after a real win streak). An EMA actor
+# structurally caps how far the *deployed/acting* policy can move per update to
+# (1-TARGET_TAU) of that update's raw magnitude regardless of how large the raw
+# gradient step was - unlike ADV_CLIP/GAE_LAMBDA/reward-softening/the anchor buffer
+# (all tried previously, all acting on the advantage/reward values feeding the
+# gradient, not on how far the actual weights are allowed to move), this doesn't
+# require detecting the anomaly via a proxy signal first. `agent` still trains at
+# full speed via ppo_update; only the environment-facing actor is smoothed. PPO's
+# ratio/clipping already tolerates the resulting agent/target_agent divergence (this
+# codebase already accepted a smaller version of the same staleness - rollout N vs.
+# the policy that collected it - in the now-reverted threaded actor/learner overlap).
+# 2026-10-09: raised 0.01->0.03 - a root-cause investigation into the recurring
+# win-rate collapse found target_values (used for V(s) at every GAE timestep, not
+# just the final bootstrap - see above) lags the live policy by ~1/TARGET_TAU
+# updates. At 0.01 that's ~100 updates, same order as the observed 30-150-update
+# collapse-then-recover cycles: once real performance drops, the still-optimistic
+# stale baseline makes every action look worse than it is, pushing the policy away
+# from its current (not necessarily bad) behavior for the full lag window before
+# self-correcting as the target catches down. Shrinking the lag to ~33 updates
+# tests whether this is a real contributing driver without removing the target
+# network outright (it still guards against the moving-target oscillation it was
+# originally added for - see the 2026-09-03 comment above).
+TARGET_TAU = 0.03
 # freezes everything but value_head - tests whether V(s) can learn genuine state-
 # awareness against a stable, non-degrading policy, isolated from the self-
 # reinforcing bad-policy/bad-data loop diagnosed this session (see CLAUDE.md).
@@ -283,11 +436,12 @@ FREEZE_POLICY = False
 @dataclass
 class Rollout:
     # compressed form of what encode_observation's "spatial" plane stack holds - see
-    # observation.py's reconstruct_spatial_torch. bool_planes are [is_land,
-    # is_impassable, is_mine, is_enemy]; owner_grid + ratio_table reconstruct
-    # troop_ratio/troop_advantage on demand instead of storing them as float planes
-    # for every one of STEPS ticks (~49% smaller than the old 6-channel float16 form).
+    # observation.py's reconstruct_spatial_torch. bool_planes are [is_mine, is_enemy];
+    # static_planes [is_land, is_impassable] are stored once per rollout, not per tick
+    # (assumes the map never changes mid-episode - breaks with water nukes);
+    # owner_grid + ratio_table reconstruct troop_ratio/troop_advantage on demand.
     bool_planes: np.ndarray
+    static_planes: np.ndarray
     owner_grid: np.ndarray
     ratio_table: np.ndarray
     scalar: np.ndarray
@@ -398,9 +552,11 @@ def collect_rollout(
 
     num_envs = len(episodes)
     height, width = episodes[0].land_mask.shape
-    # is_land, is_impassable, is_mine, is_enemy - genuinely binary, unlike
-    # troop_ratio/troop_advantage below, so bool (not float16) is lossless here.
-    bool_planes_buf = np.zeros((STEPS, num_envs, 4, height, width), dtype=bool)
+    # is_mine, is_enemy - genuinely binary, unlike troop_ratio/troop_advantage below,
+    # so bool (not float16) is lossless here.
+    bool_planes_buf = np.zeros((STEPS, num_envs, 2, height, width), dtype=bool)
+    # is_land/is_impassable captured once - see Rollout.static_planes.
+    static_planes = np.stack([episodes[0].land_mask, episodes[0].impassable_mask]).copy()
     # int16, not uint16: PyTorch's uint16 op support is spotty, and smallID (12-bit
     # protocol field, max 4095) fits int16 (max 32767) with room to spare.
     owner_grid_buf = np.zeros((STEPS, num_envs, height, width), dtype=np.int16)
@@ -449,9 +605,7 @@ def collect_rollout(
             episode = episodes[k]
             step_result = step_results[k]
 
-            bool_planes_buf[i, k] = np.stack([
-                episode.land_mask, episode.impassable_mask, episode.is_mine, episode.is_enemy,
-            ])
+            bool_planes_buf[i, k] = np.stack([episode.is_mine, episode.is_enemy])
             owner_grid_buf[i, k] = episode.owner_grid
             ratio_table_buf[i, k] = episode.ratio_table
             scalar_buf[i, k] = episode.scalar
@@ -510,6 +664,7 @@ def collect_rollout(
 
     rollout = Rollout(
         bool_planes=bool_planes_buf,
+        static_planes=static_planes,
         owner_grid=owner_grid_buf,
         ratio_table=ratio_table_buf,
         scalar=scalar_buf,
@@ -543,6 +698,7 @@ def ppo_update(
     return_stats: RunningMeanStd,
     entropy_coef: float,
     anchor_buffer: AnchorBuffer,
+    low_ratio_buffer: AnchorBuffer,
     member_id: int = 0,
 ) -> tuple[int, int, float]:
     # snapshot before any gradient steps this update - compared against the post-update
@@ -553,6 +709,7 @@ def ppo_update(
     params_before = torch.cat([p.detach().flatten() for p in agent.parameters()])
 
     bool_planes_buf = torch.from_numpy(rollout.bool_planes)
+    static_planes = torch.from_numpy(rollout.static_planes).to(DEVICE)
     owner_grid_buf = torch.from_numpy(rollout.owner_grid)
     ratio_table_buf = torch.from_numpy(rollout.ratio_table)
     scalar_buf = torch.from_numpy(rollout.scalar)
@@ -584,7 +741,7 @@ def ppo_update(
             chunk_scalar = flat_scalar[idx].to(DEVICE)
             chunk_spatial = reconstruct_spatial_torch(
                 flat_bool[idx].to(DEVICE), flat_owner[idx].to(DEVICE).long(),
-                flat_ratio[idx].to(DEVICE).float(), chunk_scalar[:, 1],
+                flat_ratio[idx].to(DEVICE).float(), chunk_scalar[:, 1], static_planes,
             )
             chunk_value = target_agent.get_value(
                 spatial=chunk_spatial, scalar=chunk_scalar,
@@ -658,6 +815,17 @@ def ppo_update(
         scalar_buf.numpy(), entities_buf.numpy(), entity_masks.numpy(),
         actions.numpy(), raw_advantages_np, returns.numpy(),
         HIGH_RATIO_THRESHOLD, update, ANCHOR_MAX_INSERT_PER_UPDATE,
+        high_ratio_ceiling=HIGH_RATIO_CEILING,
+    )
+
+    # see LOW_RATIO_* constants above - keeps the value head calibrated on this tail
+    # regardless of how rare it's become in the live rollout.
+    low_ratio_buffer.evict_older_than(update, LOW_RATIO_MAX_AGE_UPDATES)
+    low_ratio_inserted = low_ratio_buffer.insert_low_ratio_from_rollout(
+        bool_planes_buf.numpy(), owner_grid_buf.numpy(), ratio_table_buf.numpy(),
+        scalar_buf.numpy(), entities_buf.numpy(), entity_masks.numpy(),
+        actions.numpy(), returns.numpy(),
+        LOW_RATIO_THRESHOLD, update, LOW_RATIO_MAX_INSERT_PER_UPDATE,
     )
 
     rollout_elapsed = rollout.elapsed
@@ -687,7 +855,11 @@ def ppo_update(
     low_ratio_err_sum, low_ratio_err_count = 0.0, 0
     normal_err_sum, normal_err_count = 0.0, 0
     anchor_loss_sum, anchor_steps = 0.0, 0
-    anchor_coef = ANCHOR_COEF_BASE + ANCHOR_COEF_SCALE * frac_low_ratio
+    low_ratio_loss_sum, low_ratio_steps = 0.0, 0
+    # 0.0 zeroes its gradient contribution exactly (still samples/forward-passes the
+    # anchor batch for logging, but anchor_loss*0.0 backward is a no-op) - simpler than
+    # restructuring the epoch loop to skip the step outright, identical end behavior.
+    anchor_coef = 0.0 if OFM_ABLATION == "no_anchor" else ANCHOR_COEF
     for epoch in range(PPO_EPOCHS):
         epochs_run = epoch + 1
         indices = torch.randperm(total)
@@ -697,7 +869,7 @@ def ppo_update(
             batch_scalar = scalar_buf[batch_idx].to(DEVICE)
             batch_spatial = reconstruct_spatial_torch(
                 bool_planes_buf[batch_idx].to(DEVICE), owner_grid_buf[batch_idx].to(DEVICE).long(),
-                ratio_table_buf[batch_idx].to(DEVICE).float(), batch_scalar[:, 1],
+                ratio_table_buf[batch_idx].to(DEVICE).float(), batch_scalar[:, 1], static_planes,
             )
 
             new_action, new_log_prob, entropy, new_value = agent.get_action_and_value(
@@ -768,7 +940,7 @@ def ppo_update(
                 torch.from_numpy(anchor_batch["bool_planes"]).to(DEVICE),
                 torch.from_numpy(anchor_batch["owner_grid"]).to(DEVICE).long(),
                 torch.from_numpy(anchor_batch["ratio_table"]).to(DEVICE).float(),
-                a_scalar[:, 1],
+                a_scalar[:, 1], static_planes,
             )
             a_entities = torch.from_numpy(anchor_batch["entities"]).to(DEVICE)
             a_entity_mask = torch.from_numpy(anchor_batch["entity_mask"]).to(DEVICE)
@@ -781,13 +953,16 @@ def ppo_update(
             )
             a_value = a_value.squeeze(-1)
             # weight is detached - only the log_prob/value regression get gradient, not
-            # the advantage-like weight itself (standard SIL form).
+            # the advantage-like weight itself (standard SIL form). Scaled by return_std
+            # for consistency with the main value_loss below - without this, a_return/
+            # a_value drift (e.g. once the rollout narrows away from anchor-like states)
+            # is unbounded in raw return-magnitude terms, unlike every other loss term here.
             with torch.no_grad():
-                weight = torch.clamp(a_return - a_value, min=0.0)
+                weight = torch.clamp((a_return - a_value) / return_std, min=0.0)
             policy_term = -(weight * a_log_prob).mean()
             # only pushes value UP toward a demonstrated good return, never down - can't
             # fight the main value loss on states it's already right about.
-            value_term = 0.5 * torch.clamp(a_return - a_value, min=0.0).square().mean()
+            value_term = 0.5 * torch.clamp((a_return - a_value) / return_std, min=0.0).square().mean()
             anchor_loss = anchor_coef * (policy_term + VALUE_COEF * value_term)
 
             optimizer.zero_grad()
@@ -796,6 +971,33 @@ def ppo_update(
             optimizer.step()
             anchor_loss_sum += anchor_loss.item()
             anchor_steps += 1
+
+        low_ratio_batch = low_ratio_buffer.sample(LOW_RATIO_MINIBATCH_SIZE) if len(low_ratio_buffer) >= LOW_RATIO_MIN_FILL else None
+        if low_ratio_batch is not None:
+            lr_scalar = torch.from_numpy(low_ratio_batch["scalar"]).to(DEVICE)
+            lr_spatial = reconstruct_spatial_torch(
+                torch.from_numpy(low_ratio_batch["bool_planes"]).to(DEVICE),
+                torch.from_numpy(low_ratio_batch["owner_grid"]).to(DEVICE).long(),
+                torch.from_numpy(low_ratio_batch["ratio_table"]).to(DEVICE).float(),
+                lr_scalar[:, 1], static_planes,
+            )
+            lr_entities = torch.from_numpy(low_ratio_batch["entities"]).to(DEVICE)
+            lr_entity_mask = torch.from_numpy(low_ratio_batch["entity_mask"]).to(DEVICE)
+            lr_return = torch.from_numpy(low_ratio_batch["ret"]).to(DEVICE)
+
+            lr_value = agent.get_value(
+                spatial=lr_spatial, scalar=lr_scalar, entities=lr_entities, entity_mask=lr_entity_mask,
+            ).squeeze(-1)
+            # plain regression toward the stored return, no policy term - see
+            # LOW_RATIO_* constants above for why (value calibration, not imitation).
+            low_ratio_loss = LOW_RATIO_COEF * VALUE_COEF * 0.5 * (((lr_return - lr_value) / return_std) ** 2).mean()
+
+            optimizer.zero_grad()
+            low_ratio_loss.backward()
+            torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+            optimizer.step()
+            low_ratio_loss_sum += low_ratio_loss.item()
+            low_ratio_steps += 1
 
     mean_gold_at_win = (
         sum(rollout.episode_end_golds_win) / len(rollout.episode_end_golds_win) if rollout.episode_end_golds_win else 0.0
@@ -830,6 +1032,8 @@ def ppo_update(
         f"value_err_normal={normal_err_sum / max(normal_err_count, 1):.4f}(n={normal_err_count}) "
         f"anchor_buffer_size={len(anchor_buffer)} anchor_inserted={anchor_inserted} "
         f"anchor_coef={anchor_coef:.4f} anchor_loss={anchor_loss_sum / max(anchor_steps, 1):.4f} "
+        f"low_ratio_buffer_size={len(low_ratio_buffer)} low_ratio_inserted={low_ratio_inserted} "
+        f"low_ratio_loss={low_ratio_loss_sum / max(low_ratio_steps, 1):.4f} "
         f"raw_adv_mean={raw_advantage_mean:.4f} raw_adv_std={raw_advantage_std:.4f} "
         f"weight_delta_l2={weight_delta_l2:.4f} entropy_coef={entropy_coef:.4f} "
         f"time={total_elapsed:.1f}s (rollout={rollout_elapsed:.1f}s ppo={ppo_elapsed:.1f}s) "
@@ -851,12 +1055,19 @@ class Member:
     gold_stats: RunningMeanStd = field(default_factory=RunningMeanStd)
     return_stats: RunningMeanStd = field(default_factory=RunningMeanStd)
     anchor_buffer: AnchorBuffer = field(default_factory=lambda: AnchorBuffer(ANCHOR_BUFFER_CAPACITY))
+    low_ratio_buffer: AnchorBuffer = field(default_factory=lambda: AnchorBuffer(LOW_RATIO_BUFFER_CAPACITY))
     win_rate_ema: float = 0.0
     entropy_scale: float = 1.0
     lr_scale: float = 1.0
+    # rate-limited toward entropy_coef_for(win_rate_ema)*entropy_scale each update - see
+    # ENTROPY_COEF_MAX_STEP above. Not derived fresh each update like the old scheme.
+    entropy_coef_current: float = ENTROPY_COEF_MIN
     total_episodes: int = 0
     total_wins: int = 0
     checkpoint_total_train_hours: float = 0.0
+    # update index this member's optimizer was (re)built at - None once warmup has run
+    # its course, so the per-update LR-scaling loop below has nothing left to do.
+    optimizer_reset_at: int | None = None
 
 
 def _load_member(member_id: int, vec_bridge: VecOpenFrontBridge) -> Member:
@@ -881,9 +1092,18 @@ def _load_member(member_id: int, vec_bridge: VecOpenFrontBridge) -> Member:
         entropy_scale = checkpoint.get("entropy_scale", 1.0)
         lr_scale = checkpoint.get("lr_scale", 1.0)
         checkpoint_total_train_hours = checkpoint.get("total_train_hours", 0.0)
+    # missing from an older checkpoint (predates ENTROPY_COEF_MAX_STEP) - initialize to
+    # what the old formula would already give at this win_rate_ema, not a fixed default,
+    # so a resume doesn't cause a sudden jump the rate limit would otherwise prevent.
+    entropy_coef_current = (
+        checkpoint.get("entropy_coef_current") if checkpoint is not None else None
+    )
+    if entropy_coef_current is None:
+        entropy_coef_current = entropy_coef_for(win_rate_ema) * entropy_scale
 
     episodes = start_all_episodes(vec_bridge, gold_stats)
     agent = Agent.from_observation(episodes[0].spatial, episodes[0].scalar, episodes[0].entities).to(DEVICE)
+    reinitialized = []
     if checkpoint is not None:
         # strict=False only skips missing/unexpected keys - a shape mismatch (e.g.
         # entity_dim growing when a new per-entity feature is added) still raises, so
@@ -911,6 +1131,26 @@ def _load_member(member_id: int, vec_bridge: VecOpenFrontBridge) -> Member:
 
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, agent.parameters()), lr=LR * lr_scale)
 
+    # restore Adam's per-parameter momentum/variance so a resume doesn't cold-start the
+    # optimizer against an already-converged network - see LR_WARMUP_UPDATES above for
+    # why that combination is risky. Only safe when the param list is unchanged (no
+    # reinitialized/shape-mismatched keys - state tensors from the old shapes wouldn't
+    # line up) and an older checkpoint predating this field just falls through to warmup.
+    optimizer_reset_at = None
+    if checkpoint is not None:
+        optimizer_state = checkpoint.get("optimizer")
+        if optimizer_state is not None and not reinitialized:
+            try:
+                optimizer.load_state_dict(optimizer_state)
+                print(f"member{member_id} restored optimizer state from {checkpoint_path}")
+            except (ValueError, RuntimeError) as e:
+                print(f"member{member_id} could not restore optimizer state ({e}) - falling back to LR warmup")
+                optimizer_reset_at = 0
+        else:
+            reason = "reinitialized params" if reinitialized else "no saved optimizer state (older checkpoint)"
+            print(f"member{member_id} optimizer state not restored ({reason}) - falling back to LR warmup")
+            optimizer_reset_at = 0
+
     # target network for GAE's value bootstrap (see TARGET_TAU above) - always
     # (re)started as an exact copy of the just-resumed live agent rather than
     # separately persisted across restarts; losing a few updates of lag right after
@@ -923,7 +1163,9 @@ def _load_member(member_id: int, vec_bridge: VecOpenFrontBridge) -> Member:
         id=member_id, checkpoint_dir=checkpoint_dir, vec_bridge=vec_bridge, agent=agent, target_agent=target_agent,
         optimizer=optimizer, episodes=episodes, gold_stats=gold_stats, return_stats=return_stats,
         win_rate_ema=win_rate_ema, entropy_scale=entropy_scale, lr_scale=lr_scale,
+        entropy_coef_current=entropy_coef_current,
         checkpoint_total_train_hours=checkpoint_total_train_hours,
+        optimizer_reset_at=optimizer_reset_at,
     )
 
 
@@ -942,22 +1184,36 @@ def _pbt_step(members: list[Member], update: int) -> None:
     # with the weights it now actually has.
     worst.target_agent.load_state_dict(best.target_agent.state_dict())
     worst.win_rate_ema = best.win_rate_ema
+    # otherwise the just-copied member would keep rate-limiting from its own stale
+    # pre-exploit value, fighting the weights/win_rate_ema it just inherited.
+    worst.entropy_coef_current = best.entropy_coef_current
     worst.gold_stats.mean, worst.gold_stats.var, worst.gold_stats.count = (
         best.gold_stats.mean, best.gold_stats.var, best.gold_stats.count
     )
     worst.return_stats.mean, worst.return_stats.var, worst.return_stats.count = (
         best.return_stats.mean, best.return_stats.var, best.return_stats.count
     )
+    # otherwise the just-copied member keeps self-imitating against anchors sampled
+    # from its own just-discarded (worse) trajectory, feeding mismatched gradients
+    # into weights that no longer produced them - same rationale as the state above.
+    worst.anchor_buffer = copy.deepcopy(best.anchor_buffer)
     # clamped so repeated exploit/explore rounds can't compound toward an extreme
     # multiplier over a long run (0.8x or 1.2x every ~32 updates, unbounded, would
-    # drift arbitrarily far given enough rounds).
-    worst.entropy_scale = max(0.3, min(3.0, best.entropy_scale * random.choice(PBT_PERTURB_FACTORS)))
-    worst.lr_scale = max(0.3, min(3.0, best.lr_scale * random.choice(PBT_PERTURB_FACTORS)))
+    # drift arbitrarily far given enough rounds). 2026-09-22: observed lr_scale
+    # compounding upward across real exploit events (1.02 -> 1.84x) while entropy_scale
+    # drifted down (~0.45-0.78x) - tightened from [0.3, 3.0] since a freshly-copied
+    # member also gets its Adam state reset (below), so a high lr_scale right after
+    # a weight jump has no momentum smoothing to damp it.
+    worst.entropy_scale = max(0.5, min(1.5, best.entropy_scale * random.choice(PBT_PERTURB_FACTORS)))
+    worst.lr_scale = max(0.5, min(1.5, best.lr_scale * random.choice(PBT_PERTURB_FACTORS)))
     # stale Adam momentum/variance estimates would otherwise fight the just-copied
     # weights - fresh optimizer state at the new (perturbed) LR instead.
     worst.optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, worst.agent.parameters()), lr=LR * worst.lr_scale
     )
+    # same LR-warmup treatment as a fresh resume gets (see LR_WARMUP_UPDATES) - this
+    # optimizer is just as cold as one built at process start.
+    worst.optimizer_reset_at = update
     print(
         f"[pbt] update {update}: member{worst.id} (ema={worst_ema_before_copy:.3f} before copy) "
         f"exploited member{best.id} (ema={best.win_rate_ema:.3f}) - "
@@ -975,25 +1231,63 @@ def train():
         # ran as a population - same "take whichever source is ahead" rule as before.
         total_train_hours = max([total_train_hours] + [m.checkpoint_total_train_hours for m in members])
 
-        print(f"training on device={DEVICE}, pop_size={POP_SIZE}, num_envs_per_member={NUM_ENVS_PER_MEMBER}")
+        print(
+            f"training on device={DEVICE}, pop_size={POP_SIZE}, num_envs_per_member={NUM_ENVS_PER_MEMBER}, "
+            f"ablation={OFM_ABLATION}"
+        )
 
         for update in range(NUM_UPDATES):
             for m in members:
+                # 2026-10-02: reverted to m.agent (was m.target_agent, the EMA-smoothed
+                # network - see TARGET_TAU above). The EMA actor's effective averaging
+                # window is ~1/TARGET_TAU=100 updates, which also means it takes ~100x
+                # longer in update-count for any behavioral change to show up in the
+                # collected rollout at all - a control-ablation run sat at ~1-2% win rate
+                # for 170+ updates with no visible trend, consistent with this damping
+                # rather than a real plateau. target_agent still drives GAE's value
+                # bootstrap below (its original, lower-risk use) - only the
+                # environment-facing policy reverts to the live, fast-moving one.
                 m.episodes, rollout = collect_rollout(m.vec_bridge, m.agent, m.episodes, m.gold_stats)
                 target_last_value = compute_value_for_episodes(m.target_agent, m.episodes)
 
                 current_win_rate = rollout.episode_wins / rollout.episodes_finished if rollout.episodes_finished else m.win_rate_ema
                 m.win_rate_ema = WIN_RATE_EMA_ALPHA * current_win_rate + (1 - WIN_RATE_EMA_ALPHA) * m.win_rate_ema
 
+                if m.optimizer_reset_at is not None:
+                    updates_since_reset = update - m.optimizer_reset_at
+                    if updates_since_reset < LR_WARMUP_UPDATES:
+                        warmup_frac = (updates_since_reset + 1) / LR_WARMUP_UPDATES
+                        for group in m.optimizer.param_groups:
+                            group["lr"] = LR * m.lr_scale * warmup_frac
+                    else:
+                        for group in m.optimizer.param_groups:
+                            group["lr"] = LR * m.lr_scale
+                        m.optimizer_reset_at = None
+
+                if OFM_ABLATION == "fixed_entropy":
+                    # adaptation fully disabled - isolates whether win-rate-driven
+                    # entropy_coef (even rate-limited) is a contributor at all.
+                    m.entropy_coef_current = FIXED_ENTROPY_COEF
+                else:
+                    # rate-limited toward the target instead of snapping to it - see
+                    # ENTROPY_COEF_MAX_STEP above (anti-windup fix for the entropy/win-rate
+                    # feedback loop).
+                    entropy_coef_target = entropy_coef_for(m.win_rate_ema) * m.entropy_scale
+                    m.entropy_coef_current += max(
+                        -ENTROPY_COEF_MAX_STEP, min(ENTROPY_COEF_MAX_STEP, entropy_coef_target - m.entropy_coef_current)
+                    )
+
                 episodes_finished, episode_wins, total_train_hours = ppo_update(
                     rollout, m.agent, m.target_agent, target_last_value, m.optimizer, update, total_train_hours,
-                    m.return_stats, entropy_coef_for(m.win_rate_ema) * m.entropy_scale, m.anchor_buffer,
+                    m.return_stats, m.entropy_coef_current, m.anchor_buffer, m.low_ratio_buffer,
                     member_id=m.id,
                 )
                 m.target_agent.soft_update_from(m.agent, TARGET_TAU)
                 save_total_train_hours(total_train_hours)
                 m.total_episodes += episodes_finished
                 m.total_wins += episode_wins
+                # frees this member's buffers before the next member's collect_rollout allocates its own
+                del rollout
 
             if update != 0 and update % PBT_INTERVAL == 0:
                 _pbt_step(members, update)
@@ -1002,7 +1296,8 @@ def train():
                 for m in members:
                     save_checkpoint(
                         m.checkpoint_dir, m.agent, update, m.gold_stats, m.return_stats, total_train_hours,
-                        m.win_rate_ema, m.entropy_scale, m.lr_scale,
+                        m.win_rate_ema, m.entropy_scale, m.lr_scale, optimizer=m.optimizer,
+                        entropy_coef_current=m.entropy_coef_current,
                     )
                 # also mirror the current best member's checkpoint into the root
                 # checkpoints/ dir - keeps watch.py's plain latest_checkpoint() call
@@ -1010,13 +1305,15 @@ def train():
                 best = max(members, key=lambda m: m.win_rate_ema)
                 save_checkpoint(
                     CHECKPOINT_DIR, best.agent, update, best.gold_stats, best.return_stats, total_train_hours,
-                    best.win_rate_ema, best.entropy_scale, best.lr_scale,
+                    best.win_rate_ema, best.entropy_scale, best.lr_scale, optimizer=best.optimizer,
+                    entropy_coef_current=best.entropy_coef_current,
                 )
 
         for m in members:
             save_checkpoint(
                 m.checkpoint_dir, m.agent, NUM_UPDATES, m.gold_stats, m.return_stats, total_train_hours,
-                m.win_rate_ema, m.entropy_scale, m.lr_scale,
+                m.win_rate_ema, m.entropy_scale, m.lr_scale, optimizer=m.optimizer,
+                entropy_coef_current=m.entropy_coef_current,
             )
             win_rate = m.total_wins / m.total_episodes if m.total_episodes > 0 else 0.0
             print(
