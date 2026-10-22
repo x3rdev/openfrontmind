@@ -1,21 +1,9 @@
-"""Decodes raw bridge updates into accumulated game state.
+"""Decodes raw bridge updates into accumulated game state (no display code).
 
-No display concerns here (no cv2) - this is shared by both visualization
-(map_view.py) and the observation encoder, so it can't depend on either.
-
-Bit layout below is taken directly from the packing logic in
-engine/OpenFrontIO/src/core/game/GameImpl.ts (recordTileUpdate) and
-GameMap.ts (GameMapImpl's PLAYER_ID_MASK/IS_LAND_BIT etc):
-
+Tile packing, from GameImpl.recordTileUpdate and GameMap:
   packed = (tileState & 0xffff) | (terrainByte << 16)
-
-  tileState (low 16 bits):
-    bits 0-11  owner smallID (0 = unowned)
-    bit 13     fallout
-    bit 14     defense bonus
-
-  terrainByte (bits 16-23 of packed, so absolute bit 16+N):
-    bit 23 (terrainByte bit 7)  is land
+  tileState bits 0-11 owner smallID (0 = unowned), bit 13 fallout, bit 14 defense bonus
+  terrainByte bit 7 (bit 23 of packed) is land
 """
 
 from dataclasses import dataclass
@@ -31,9 +19,7 @@ IS_LAND_BIT = 23  # terrainByte's IS_LAND_BIT (7) shifted by 16
 
 @dataclass
 class EpisodeState:
-    """One in-flight episode's accumulated state - shared shape between train.py's
-    vectorized rollout collection and watch.py's single-game playback, so the two
-    can't silently diverge on what an "episode" carries (see apply_step/apply_reset)."""
+    """One in-flight episode's state, shared by train.py and watch.py."""
     width: int
     height: int
     owner_grid: np.ndarray
@@ -55,11 +41,6 @@ class EpisodeState:
     ticks: int = 0
     peak: float = 0.0
     difficulty: str = ""
-    phi: float | None = None
-    phase: int = 0
-    tau: float = 0.0
-    wait: int = 0
-    inc_ref: float = 0.0
 
 
 def apply_tile_updates(
@@ -71,10 +52,8 @@ def apply_tile_updates(
     agent_small_id: int,
     is_mine: np.ndarray,
     is_enemy: np.ndarray,
-    troop_ratio_plane: np.ndarray | None = None,
-    troop_advantage_plane: np.ndarray | None = None
 ) -> None:
-    """Updates is_mine/is_enemy in place at the changed tiles only."""
+    """Updates owner_grid, land_mask, is_mine and is_enemy in place at the changed tiles."""
     if tile_updates is None or len(tile_updates) == 0:
         return
     refs = tile_updates[0::2]
@@ -91,20 +70,13 @@ def apply_tile_updates(
 
 
 
-
-
 def apply_land_bitmap(land_mask: np.ndarray, width: int, bitmap: np.ndarray) -> None:
-    """One-time full terrain dump at reset (server.ts's landBitmap) - unlike
-    tile_updates deltas, which only ever cover a tile once its owner/water/fallout
-    state changes at least once, this covers every tile so land_mask starts
-    complete instead of growing in from near-empty over the course of an episode."""
+    """One-time full terrain dump at reset, so land_mask starts complete."""
     land_mask[:] = bitmap.reshape(land_mask.shape).astype(bool)
 
 
 def apply_impassable_bitmap(impassable_mask: np.ndarray, width: int, bitmap: np.ndarray) -> None:
-    """One-time full dump at reset (server.ts's impassableBitmap) - unlike land_mask,
-    impassability can never change mid-episode (GameMap.ts's setWater() refuses to
-    touch impassable tiles), so this never needs tile_updates upkeep."""
+    """One-time dump at reset; impassable tiles never change mid-episode."""
     impassable_mask[:] = bitmap.reshape(impassable_mask.shape).astype(bool)
 
 
@@ -121,17 +93,14 @@ def apply_unit_updates(units: dict, unit_updates: list | None) -> None:
 def apply_player_updates(player_stats: dict, player_updates) -> None:
     if player_updates is None:
         return
-    # quint since upstream added goldEarned (PlayerImpl.toUpdate) - unused here.
+    # five fields per player; goldEarned is unused
     for i in range(0, len(player_updates), 5):
         small_id, tiles, gold, troops, _gold_earned = player_updates[i:i + 5]
         player_stats[int(small_id)] = {"tilesOwned": tiles, "gold": gold, "troops": troops}
 
 
 def apply_max_troops(player_stats: dict, max_troops: dict) -> None:
-    """maxTroops arrives as a plain JSON side-channel (server.ts), not the packed
-    delta stream - full every tick, for every player, unlike packedPlayerUpdates
-    which only carries players whose stats changed. Merged in rather than replacing,
-    since a player's tilesOwned/gold/troops entry may not have arrived yet."""
+    """maxTroops arrives as a JSON side-channel with every player each tick; merge it in."""
     for sid, cap in max_troops.items():
         player_stats.setdefault(int(sid), {})["maxTroops"] = cap
 
@@ -151,10 +120,8 @@ def apply_reset(
     owner_grid: np.ndarray, land_mask: np.ndarray, impassable_mask: np.ndarray,
     is_mine: np.ndarray, is_enemy: np.ndarray, width: int, setup: dict,
 ) -> tuple[dict, int, dict]:
-    """Applies bridge.reset()'s full-dump payload to the given masks in place.
-    Returns (player_stats, agent_small_id, player_types) - callers still own total_land
-    (setup["totalLand"]) and any gold-stats handling, since train.py/watch.py disagree on
-    whether the running gold stats get updated here or stay frozen (see apply_step)."""
+    """Applies reset()'s full dump to the masks in place.
+    Returns (player_stats, agent_small_id, player_types)."""
     player_stats: dict = {}
     agent_small_id = setup["agentSmallID"]
     apply_tile_updates(
@@ -169,18 +136,11 @@ def apply_reset(
 
 
 def apply_step(episode: EpisodeState, step_result: dict) -> tuple[np.ndarray, dict, dict, bool, bool]:
-    """Applies one tick's bridge.step() result to episode's masks/player_stats/spatial/
-    scalar/targets in place. episode.entities/entity_mask are NOT touched - gold
-    normalization has to run on the entity_features returned here before pad_entities(),
-    and train.py updates its running gold stats from every tick's real entities while
-    watch.py normalizes with a frozen checkpoint snapshot instead (see CLAUDE.md's gold-
-    normalization note) - folding that in here would force one script's semantics onto
-    the other. Callers apply their own gold treatment + pad_entities(), then assign
-    episode.entities/entity_mask themselves.
+    """Applies one step() result to the episode in place.
 
-    Returns (entity_features, prev_stats, curr_stats, done, won). prev_stats is a
-    snapshot from before this tick's updates were applied, for reward/diagnostic deltas.
-    """
+    episode.entities/entity_mask are left alone: callers normalise gold on the returned
+    entity_features (train updates running stats, watch uses frozen ones) and then pad.
+    Returns (entity_features, prev_stats, curr_stats, done, won)."""
     prev_stats = episode.player_stats.get(episode.agent_small_id, {})
 
     apply_player_updates(episode.player_stats, step_result["packedPlayerUpdates"])
@@ -191,7 +151,7 @@ def apply_step(episode: EpisodeState, step_result: dict) -> tuple[np.ndarray, di
     )
 
     curr_stats = episode.player_stats.get(episode.agent_small_id, {})
-    # elimination is its own loss - the wider FFA runs long after we're wiped out
+    # being eliminated ends the episode as a loss
     eliminated = curr_stats.get("tilesOwned", 0.0) == 0.0
     done = step_result["done"] or eliminated
     won = (not eliminated) and step_result["winner"] == episode.agent_name

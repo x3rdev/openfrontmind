@@ -52,8 +52,7 @@ class OpenFrontBridge:
         self.nations = nations
         self.difficulty = difficulty
 
-        # dist/server.mjs isn't rebuilt automatically otherwise, so a stale
-        # build can silently keep running old harness.ts/server.ts logic.
+        # rebuild so a stale dist/server.mjs can't run old harness logic
         env_dir = REPO_ROOT / "env"
         if build:
             _ensure_built()
@@ -64,15 +63,7 @@ class OpenFrontBridge:
             stderr=subprocess.PIPE,
             text=True
         )
-        # stderr was previously left to inherit the parent fd, which should have
-        # surfaced any crash message but in practice never did for the recurring
-        # "env died mid-step" crash - capturing it explicitly (and keeping a
-        # bounded tail) means the next occurrence's raised error actually
-        # contains whatever node did or didn't print, instead of just the
-        # opaque JSONDecodeError from reading an empty (EOF) line. A drain
-        # thread is required so a chatty stderr can't fill the pipe buffer and
-        # deadlock the process - it also echoes each line live so nothing is
-        # lost even if this process itself dies before reading _stderr_tail.
+        # capture stderr so a crashed env server's message ends up in the raised error
         self._stderr_tail = deque(maxlen=200)
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thread.start()
@@ -83,9 +74,7 @@ class OpenFrontBridge:
             print(f"[node stderr] {line}", end="", file=sys.stderr)
 
     def reset(self, seed=None, map=None, bots=None, nations=None, difficulty=None) -> dict:
-        # Only include a field if the caller (or the constructor) actually
-        # specified one - anything left as None is omitted, so harness.ts's
-        # reset() applies its own default instead of it being shadowed here.
+        # fields left as None are omitted so harness.ts applies its own defaults
         cmd = {"cmd": "reset"}
         seed = seed if seed is not None else self.seed
         map = map if map is not None else self.map
@@ -116,23 +105,14 @@ class OpenFrontBridge:
         self.process.stdin.flush()
         line = self.process.stdout.readline()
         if line == "":
-            # readline() returns "" only on EOF - the node process died (crash,
-            # signal, or otherwise) between our write and this read. json.loads("")
-            # would raise an opaque "Expecting value: line 1 column 1 (char 0)"
-            # that discards everything about why - surface the exit code/signal
-            # and whatever stderr it printed instead, so this is diagnosable
-            # instead of a dead end.
+            # EOF: the node process died
             returncode = self.process.wait(timeout=5)
             stderr_tail = "\n".join(self._stderr_tail) or "(no stderr captured)"
             raise RuntimeError(
                 f"env server process died during {cmd['cmd']} (exit code {returncode}):\n{stderr_tail}"
             )
         res = json.loads(line.removeprefix("OFM:"))
-        # server.ts catches any exception from handle() and replies with
-        # cmd_success=False instead of the normal response shape - without this
-        # check that error message is silently dropped and a caller indexing a
-        # missing field (e.g. step_result["attackMask"]) sees an opaque KeyError
-        # with no indication anything went wrong server-side.
+        # server.ts reports exceptions as cmd_success=False
         if not res.get("cmd_success", True):
             raise RuntimeError(f"env server error on {cmd['cmd']}: {res.get('error')}\n{res.get('stack', '')}")
         return res

@@ -2,14 +2,7 @@ import numpy as np
 
 
 class RunningMeanStd:
-    """Welford's online algorithm for a running mean/variance - a persistent
-    estimate updated incrementally across the whole run, not just one batch.
-    Advantage normalization elsewhere recomputes fresh per-update and discards it,
-    which works there because advantages are already roughly zero-mean by
-    construction; observation features like gold need a stable, slowly-evolving
-    reference frame instead, or the network's inputs effectively change units from
-    one update to the next.
-    """
+    """Running mean and variance (Welford), kept across the whole run."""
 
     def __init__(self) -> None:
         self.mean = 0.0

@@ -1,6 +1,4 @@
-// Minimal in-process reset/step harness around engine/ (roadmap step 1).
-// No subprocess, no bridge protocol yet — just validating the API shape
-// and measuring raw ticks/sec by driving engine/'s GameRunner directly.
+// In-process reset/step harness around engine/.
 
 import fs from "fs";
 import path from "path";
@@ -37,14 +35,7 @@ const PROJECT_ROOT = path.resolve(
 
 const MAX_SPAWN_TURNS = 1000;
 
-// Loads any vendored testdata map by folder name (e.g. "world", "plains") -
-// every folder under tests/testdata/maps/ has the same map.bin/map4x.bin/
-// manifest.json layout, so one path handles all of them uniformly instead of
-// going through GameMapType/NodeGameMapLoader, which only resolves maps that
-// happen to have a GameMapType enum entry. Mirrors tests/util/Setup.ts.
-// nations/additionalNations default to [] for manifests that don't define
-// them (the synthetic maps); gameConfig.nations being a fixed number means
-// the game generates procedural nations regardless, so this is safe.
+// Loads a vendored test map by folder name (tests/testdata/maps/).
 async function loadTestMap(name: string) {
   const dir = path.join(PROJECT_ROOT, name);
   const manifest: MapManifest = JSON.parse(
@@ -90,10 +81,7 @@ export async function reset(
   difficulty: Difficulty = Difficulty.Easy,
 ): Promise<HarnessSession> {
   const gameConfig: GameConfig = {
-    // Cosmetic only - GameConfig.gameMap wants a GameMapType, but real
-    // terrain always comes from loadTestMap(map) below regardless of what's
-    // set here (most vendored testdata maps, e.g. "plains", have no
-    // GameMapType entry at all).
+    // Cosmetic: real terrain always comes from loadTestMap(map).
     gameMap: GameMapType.World,
     gameMapSize: GameMapSize.Normal,
     gameMode: GameMode.FFA,
@@ -149,9 +137,7 @@ export async function reset(
     turnNumber: 0,
     fatalError: undefined,
   };
-  // Every tile/unit update seen during the spawn-phase loop below gets
-  // collected here so reset()'s caller gets the full picture established by
-  // spawning, not just the diff from the single last tick.
+  // Collects every update from the spawn phase so reset() returns the full state.
   const spawnTileUpdates: Uint32Array[] = [];
   const spawnUnitUpdates: UnitUpdate[] = [];
   const runner = new GameRunner(
@@ -171,8 +157,7 @@ export async function reset(
   );
   runner.init();
 
-  // Spawn phase: SpawnTimerExecution ends it once config.numSpawnPhaseTurns
-  // is reached. Drive empty-intent ticks until then, same as FullGamePerf.ts.
+  // Spawn phase: drive empty ticks until SpawnTimerExecution ends it.
   while (game.inSpawnPhase()) {
     if (state.turnNumber >= MAX_SPAWN_TURNS) {
       throw new Error(`spawn phase did not end after ${MAX_SPAWN_TURNS} turns`);
@@ -198,16 +183,12 @@ export async function reset(
 }
 
 export interface AttackTarget {
-  // null targetID means unclaimed land ("wilderness") rather than a player.
+  // null targetID means unclaimed land (wilderness).
   targetID: PlayerID | null;
   smallID: number | null;
-  // true if the agent already has an active outgoing attack toward this target -
-  // re-attacking would just reinforce it (AttackExecution merges troops into the
-  // existing attack), so this lets the Python side mask out the redundant reselect.
+  // true if the agent already attacks this target; re-attacking merges into that attack.
   alreadyAttacking: boolean;
-  // troops this player currently has committed to an attack against the agent -
-  // 0 if not attacking. The agent could otherwise only see whether *it* can
-  // attack a candidate, not whether that candidate is currently hostile.
+  // troops this player has committed to attacking the agent.
   attackingMeTroops: number;
 }
 
@@ -219,16 +200,13 @@ export interface StepResult {
   packedTileUpdates?: Uint32Array;
   packedPlayerUpdates?: Float64Array;
   attackMask: AttackTarget[];
-  // Aggregate troop commitment the agent has no other way to perceive: how much
-  // of its own army is already locked into outgoing attacks, and how much total
-  // enemy troop count is currently attacking it.
+  // Troops committed to the agent's outgoing attacks, and enemy troops attacking it.
   outgoingTroops: number;
   incomingTroops: number;
   unitUpdates?: UnitUpdate[];
 }
 
-// Sentinel key for wilderness in the active-attack set below - distinct from any
-// real PlayerID since those come from the engine's own ID space.
+// Sentinel key for wilderness in the active-attack set.
 const WILDERNESS_KEY = "__wilderness__";
 
 // nearby() is what the engine's own scripted AI uses too.

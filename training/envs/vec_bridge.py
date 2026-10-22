@@ -12,11 +12,7 @@ def _worker(conn, seed, map, bots, nations):
             bridge.process.wait()
             conn.close()
             return
-        # An uncaught exception here would kill this worker process outright,
-        # closing its end of the pipe - the parent's conn.recv() would then
-        # raise an opaque EOFError with no indication of which env or why.
-        # Forwarding a normal-shaped error response keeps the worker alive and
-        # lets the parent raise one clear, attributable error instead.
+        # report errors to the parent instead of dying and closing the pipe
         try:
             res = bridge.reset(**payload) if cmd == "reset" else bridge.step(payload)
         except Exception as e:
@@ -31,10 +27,7 @@ def _check(res: dict, env_idx: int, cmd: str) -> dict:
 
 
 class _BridgeProxy:
-    # Decode work (base64/numpy) happens inside the worker process that owns
-    # this pipe, not here - profiling showed N threads all doing that
-    # CPU-bound decode in the parent contend for one GIL badly enough to
-    # outweigh the I/O parallelism threads were chosen for.
+    # Decoding happens inside each worker process; doing it in the parent threads contends on the GIL.
     def __init__(self, conn, env_idx: int):
         self.conn = conn
         self.env_idx = env_idx
@@ -58,9 +51,7 @@ class VecOpenFrontBridge():
             self.conns.append(parent_conn)
             self.procs.append(p)
         self.bridges = [_BridgeProxy(c, i) for i, c in enumerate(self.conns)]
-        # only for occasional concurrent resets (start_all_episodes / per-slot
-        # reset) - step() below talks to the pipes directly since that's the
-        # hot path where GIL contention across threads actually showed up.
+        # used only for resets; step() talks to the pipes directly
         self.executor = ThreadPoolExecutor(max_workers=num_envs)
 
     def reset(self, **kwargs):

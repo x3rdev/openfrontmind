@@ -1,10 +1,5 @@
-// Bridge protocol: newline-delimited JSON over stdin/stdout, one game per
-// process (see CLAUDE.md's parallelization section — Python spawns N of
-// these as subprocesses). Every response line is prefixed with PREFIX so
-// the Python side can discard anything that isn't ours; console.log is
-// also redirected to stderr as a second, source-level guard, since the
-// vendored engine calls console.log directly in several places and that
-// writes to stdout by default in Node.
+// Bridge protocol: newline-delimited JSON over stdin/stdout, one game per process.
+// Responses are prefixed with PREFIX, and console.log goes to stderr since the engine logs to stdout.
 console.log = console.error;
 
 import readline from "node:readline";
@@ -14,12 +9,7 @@ import { HarnessSession, reset, step } from "./harness";
 
 const PREFIX = "OFM:";
 
-// Without these, an exception thrown outside handle()'s try/catch (e.g. from a
-// stray promise, a timer callback) kills the process with node's default
-// uncaught-exception handling - which does print a stack trace, but a handler
-// here guarantees it and makes the intent explicit rather than relying on
-// node's default. A signal-killed or natively-crashed process (segfault) still
-// won't hit these - that failure mode has no JS-level hook at all.
+// Catch exceptions thrown outside handle() so the error is always printed.
 process.on("uncaughtException", (err) => {
   console.error("[server.ts] uncaughtException:", err.stack ?? err);
   process.exit(1);
@@ -38,17 +28,13 @@ function winnerToJSON(winner: Player | Team | null): string | null {
   return typeof winner === "string" ? winner : winner.name();
 }
 
-// null for a team win (Team has no smallID) or no winner yet - lets the
-// Python side look up the winner's PlayerType via reset()'s playerTypes map.
+// null for a team win or no winner yet.
 function winnerSmallID(winner: Player | Team | null): number | null {
   if (winner === null || typeof winner === "string") return null;
   return winner.smallID();
 }
 
-// Troop capacity scales with population/tiles owned (and difficulty for bots) and
-// changes over the game - the scripted AI itself gates on troops()/maxTroops() as a
-// ratio (AiAttackBehavior.ts's hasReserveRatioTroops), not raw troop count, so this
-// needs to travel every tick, not just at reset.
+// maxTroops changes over the game, so it is sent every tick.
 function maxTroopsBySmallID(session: HarnessSession): Record<number, number> {
   const config = session.game.config();
   return Object.fromEntries(
@@ -75,19 +61,13 @@ function structuresBySmallID(session: HarnessSession): Record<number, Record<str
   );
 }
 
-// The engine's own authoritative land-tile count (matches WinCheckExecution's win-
-// condition denominator exactly) - cheap field reads, safe to send every tick.
+// The engine's land-tile count, the win-condition denominator.
 function totalLand(session: HarnessSession): number {
   const map = session.game.map();
   return map.numLandTiles() - map.numTilesWithFallout();
 }
 
-// packedTileUpdates only ever covers tiles whose owner/water/fallout state has
-// changed at least once (see GameImpl.recordTileUpdate's call sites) - it is not a
-// full terrain dump. Without this, a client reconstructing land_mask purely from
-// that delta stream starts near-empty and only fills in as territory gets fought
-// over, badly undercounting total land for most of a game. Sent once at reset;
-// the normal tile-update stream keeps it in sync with any later water conversions.
+// Full terrain dump sent once at reset; tile updates only cover changed tiles.
 function landBitmap(session: HarnessSession): Uint8Array {
   const map = session.game.map();
   const bitmap = new Uint8Array(map.width() * map.height());
@@ -97,10 +77,7 @@ function landBitmap(session: HarnessSession): Uint8Array {
   return bitmap;
 }
 
-// Impassable tiles (mountains/walls) are isLand()===true in the engine but can never
-// be owned or attacked into - GameMap.ts's setWater() explicitly refuses to convert
-// them, so unlike landBitmap this is permanently fixed for a tile and only needs
-// sending once at reset, no tile_updates-stream upkeep required.
+// Impassable tiles (mountains, walls) are land but can't be owned; sent once at reset.
 function impassableBitmap(session: HarnessSession): Uint8Array {
   const map = session.game.map();
   const bitmap = new Uint8Array(map.width() * map.height());
@@ -121,11 +98,7 @@ let session: HarnessSession | undefined;
 
 async function handle(cmd: Record<string, unknown>): Promise<void> {
   if (cmd.cmd === "reset") {
-    // Only parse/validate what the client actually sent - anything absent
-    // stays undefined so harness.ts's reset() applies its own defaults,
-    // rather than duplicating (and silently overriding) them here. An
-    // unrecognized map name surfaces as an ENOENT from loadTestMap, caught
-    // by the try/catch around handle() below.
+    // Only fields the client sent are parsed; harness.ts applies the defaults.
     const map = typeof cmd.map === "string" ? cmd.map : undefined;
     const seed = typeof cmd.seed === "string" ? cmd.seed : undefined;
     const bots = typeof cmd.bots === "number" ? cmd.bots : undefined;
@@ -137,12 +110,7 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
 
     session = await reset(seed, map, bots, nations, difficulty);
     const agent = session.game.playerByClientID(session.agentClientID);
-    // agentClientID is a harness-generated constant added to the game synchronously
-    // in reset() - this is only reachable via an engine invariant break (e.g. a
-    // future refactor that stops adding the human player), never a normal outcome.
-    // Throwing surfaces it as a loud cmd_success=false (see the try/catch below,
-    // and bridge.py's matching check) instead of a silent agentSmallID: null that
-    // would corrupt every ownership mask downstream without raising anywhere.
+    // Unreachable unless an engine invariant breaks; throw instead of sending a null agentSmallID.
     if (agent === null) {
       throw new Error(`agent player not found for clientID ${session.agentClientID}`);
     }
@@ -201,9 +169,7 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
   send({ cmd_success: false, error: `unknown cmd "${String(cmd.cmd)}"` });
 }
 
-// Commands must be handled strictly one-at-a-time, in arrival order — reset()
-// is async (loads the map) while step() is sync, so without this queue a
-// step sent right after reset could race ahead and reply first.
+// Commands run one at a time in arrival order, since reset() is async and step() is sync.
 let queue: Promise<void> = Promise.resolve();
 
 const rl = readline.createInterface({ input: process.stdin });

@@ -1023,6 +1023,28 @@ RSS 31→12GB at 4 envs; `NUM_ENVS_PER_MEMBER` now 10 (~26GB, ~440 ticks/s). **A
 break with water nukes** (the live actor sees the updated `land_mask`, PPO recompute
 would see the stale one).
 
+## Current state (Oct 2026)
+
+Older sections above are history; the code now is the per-tick design below. Code from
+before the cleanup (decision/tau format, PBT, old rewards) is at git tag `pre-cleanup`.
+
+- **Action:** each tick a gate (wait/act), a pointer over bordering targets, and a Beta
+  attack size (fraction of current troops). Gate is regularised by KL to a patient
+  reference gate, not an entropy bonus.
+- **Reserve floor:** attacking is blocked below troop ratio 0.2 (`OFM_RESERVE_FLOOR`).
+  This stopped the recurring collapse: from the same checkpoint, two runs without it
+  collapsed in under 15 updates, one with it ran 160+ updates at ~100% wins (5 Easy
+  Nations).
+- **Reward:** tile gain x100, +-150 win/loss, 0.01/tick time cost, potential-based
+  shaping on lost troop production. Removing the time cost did not prevent collapse.
+- **Gate-bias sweep** (act logit +0.5/+1/+1.5): wins fall 83% -> 67% -> 25-33%. The safe
+  band for the act rate is narrow, which is why drift collapsed the policy.
+- **Limits:** 8/8 wins on Easy, 0/16 on 5 Hard Nations and 0/16 on 1v1 Hard (agent
+  matches the Nation to ~50% share, then loses). 1v1 Medium: 100%. Mixed
+  Medium/Hard training: Hard stayed at 0%.
+- **Next ideas:** city building (a city adds 250k max troops, ~18% at parity; the agent
+  ends games with ~380k idle gold), then self-play.
+
 ## Licensing note
 
 Upstream OpenFrontIO is AGPLv3 (network copyleft — matters only if we run a modified

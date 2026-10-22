@@ -1,5 +1,4 @@
 import argparse
-import os
 import zlib
 from pathlib import Path
 
@@ -12,8 +11,19 @@ from training.envs.map_view import draw_troop_counts, draw_units, outline_agent_
 from training.envs.observation import encode_observation
 from training.envs.action_space import build_entities, pad_entities, action_to_intents, DO_NOTHING
 from training.envs.running_stats import RunningMeanStd
-from training.models.policy import Agent, TAUS
-from training.models.train import DEC_INTERRUPT, DEC_WAIT_CAP, DEC_INCOMING_JUMP, latest_checkpoint, BOTS, NATIONS, DIFFICULTY
+from training.models.policy import Agent
+from training.models.train import latest_checkpoint, BOTS, NATIONS, DIFFICULTY
+
+
+def _print_bucketed(title: str, rows: list, fmt) -> None:
+    """Prints one line per troop-ratio decile that has samples."""
+    buckets = [[] for _ in range(10)]
+    for row in rows:
+        buckets[min(int(row[0] * 10), 9)].append(row)
+    print(title)
+    for b, bucket in enumerate(buckets):
+        if bucket:
+            print(f"  troop_ratio [{b / 10:.1f},{(b + 1) / 10:.1f}): n={len(bucket):5d} {fmt(bucket)}")
 
 
 def main(
@@ -25,13 +35,9 @@ def main(
     max_ticks: int | None = None, map_name: str = "mid_plains",
 ) -> dict | None:
     print(f"using checkpoint: {checkpoint_path}")
-    # env determinism alone isn't enough - get_action_and_value samples from the
-    # global torch RNG, so without this the same seed still gives a different
-    # trajectory (and potentially outcome) on every separate run of this script.
-    torch.manual_seed(zlib.crc32(seed.encode()))
+    torch.manual_seed(zlib.crc32(seed.encode()))  # actions are sampled from the torch RNG
     checkpoint = torch.load(checkpoint_path)
-    # frozen, not updated - inference should use exactly the normalization the
-    # weights were trained against, not one that keeps adapting mid-game
+    # normalization stays frozen at what the weights were trained with
     gold_stats = RunningMeanStd()
     gold_stats.mean = checkpoint["gold_mean"]
     gold_stats.var = checkpoint["gold_var"]
@@ -64,22 +70,8 @@ def main(
             spatial=spatial, scalar=scalar, entities=entities, entity_mask=entity_mask, targets=targets,
         )
 
-        decision = "tau_head.weight" in checkpoint["model"]
-        if "size_head.weight" in checkpoint["model"]:
-            os.environ["OFM_SIZE"] = "1"
-        if decision:
-            os.environ["OFM_DECISION"] = "1"
-            if log_probs or log_entropy:
-                raise SystemExit("--log-probs/--log-entropy unsupported for decision-mode checkpoints")
-        phase, tau, wait, inc_ref = 0, 0.0, 0, 0.0
         agent = Agent.from_observation(spatial, scalar, entities)
-        # shape mismatches (e.g. entity_dim growing) still raise under strict=False - drop
-        # those keys so they init fresh instead of failing the load, same as train.py
-        own_state = agent.state_dict()
-        saved_state = checkpoint["model"]
-        for k in [k for k, v in saved_state.items() if k in own_state and v.shape != own_state[k].shape]:
-            del saved_state[k]
-        agent.load_state_dict(saved_state, strict=False)
+        agent.load_state_dict(checkpoint["model"])
         agent.eval()
 
         if not headless:
@@ -92,9 +84,6 @@ def main(
             cv2.imshow("map", outline_agent_territory(img, episode.owner_grid, episode.agent_small_id, scale))
             cv2.waitKey(1)
 
-        # decision-time troop_ratio/tile_fraction, tracked before stepping - lets us
-        # see whether attacks cluster at high troop_ratio (patience) or fire immediately
-        # regardless of ratio (the greedy failure mode from the CLAUDE.md diagnostic).
         do_nothing_ticks = 0
         attack_ticks = 0
         attack_troop_ratios = []
@@ -103,94 +92,46 @@ def main(
         peak_tile_fraction = 0.0
         peak_tick = 0
 
-        # (troop_ratio, p_do_nothing) pairs, for the end-of-game bucketed summary -
-        # answers "does p(wait) actually track troop_ratio, or is it flat/dilution-bound".
-        prob_samples = []
-
-        # 2026-09-24: distinguishes two failure modes that look identical in
-        # mean_attack_troop_ratio alone - chasing the same target tick after tick
-        # (finishing off an in-progress conquest, still costly per-tick since attacks
-        # never merge - see AttackExecution notes in CLAUDE.md - but not reckless) vs.
-        # scattering across different targets while critically depleted (the actual
-        # "greedy, not patient" spam failure). (troop_ratio, incoming_ratio,
-        # same_target_as_previous_attack) - the last is None when either this or the
-        # previous attack targeted wilderness (targetID is always None there, so
-        # identity can't be compared) or this is the first attack of the game.
+        prob_samples = []  # (troop_ratio, p_do_nothing)
+        # (troop_ratio, incoming_ratio, same target as the previous attack or None)
         attack_context_samples = []
         prev_attack_target = None
-
-        # (tick, value, troop_ratio, tile_fraction, incoming_ratio) - answers "is V(s)
-        # state-aware, or is it just fitting a smooth curve against elapsed tick number"
-        # (see CLAUDE.md's earlier value-trace finding, from before troop_ratio was in
-        # the observation). incoming_ratio added alongside outgoing/incoming troops.
-        value_samples = []
-
-        # (num_candidates, gate_entropy, target_entropy) - disentangles a less-confident
-        # gate (behavioral) from a target_dist with more candidates to spread probability
-        # over (structural, grows with nations count) - see CLAUDE.md's entropy-scaling
-        # hypothesis. A fixed checkpoint run across nations=1/2/3 isolates the structural
-        # effect: if candidate_count and target_entropy rise together while gate_entropy
-        # stays flat, the hypothesis is confirmed.
-        entropy_samples = []
+        value_samples = []  # (tick, value, troop_ratio, tile_fraction, incoming_ratio)
+        entropy_samples = []  # (num_candidates, gate_entropy, target_entropy)
 
         for i in range(int(1.0e100)):
-            size_frac = None
-            if decision:
-                with torch.no_grad():
-                    tau_a, _, tgt_a, _, value, can_act = agent.act_decision(
-                        torch.from_numpy(spatial).unsqueeze(0), torch.from_numpy(scalar).unsqueeze(0),
-                        torch.from_numpy(entities).unsqueeze(0), torch.from_numpy(entity_mask).unsqueeze(0),
-                    )
-                action_idx = len(targets)
-                resample = phase == 0
-                if phase == 1:
-                    if scalar[1] >= tau and can_act.item():
-                        action_idx, phase = tgt_a.item(), 0
-                    else:
-                        wait += 1
-                        resample = DEC_INTERRUPT and (wait >= DEC_WAIT_CAP or scalar[4] - inc_ref >= DEC_INCOMING_JUMP)
-                if resample:
-                    tau, phase, wait, inc_ref = TAUS[tau_a.item()], 1, 0, float(scalar[4])
-                value = value.squeeze()
-            else:
-                with torch.no_grad():
-                    result = agent.get_action_and_value(
-                        spatial=torch.from_numpy(spatial).unsqueeze(0),
-                        scalar=torch.from_numpy(scalar).unsqueeze(0),
-                        entities=torch.from_numpy(entities).unsqueeze(0),
-                        entity_mask=torch.from_numpy(entity_mask).unsqueeze(0),
-                        action=None,
-                        return_probs=log_probs,
-                        return_entropy_components=log_entropy,
-                    )
-                action, log_prob, entropy, value = result[:4]
-                action_idx = action.item()
-                if agent.use_size:
-                    size_frac = action.item() - int(np.floor(action.item()))
-                    action_idx = int(np.floor(action.item()))
+            with torch.no_grad():
+                result = agent.get_action_and_value(
+                    spatial=torch.from_numpy(spatial).unsqueeze(0),
+                    scalar=torch.from_numpy(scalar).unsqueeze(0),
+                    entities=torch.from_numpy(entities).unsqueeze(0),
+                    entity_mask=torch.from_numpy(entity_mask).unsqueeze(0),
+                    action=None,
+                    return_probs=log_probs,
+                    return_entropy_components=log_entropy,
+                )
+            action, log_prob, entropy, value = result[:4]
+            action_idx = int(np.floor(action.item()))
+            size_frac = action.item() - action_idx
             target = targets[action_idx] if action_idx < len(targets) else DO_NOTHING
 
-            # positional, not fixed indices - matches policy.py's append order (probs
-            # first if requested, then entropy components), so either flag works alone.
+            # extras come after the first four outputs: probs first, then entropy components
             extra_idx = 4
             if log_probs:
-                probs = result[extra_idx][0]  # (MAX_ENTITIES,)
+                probs = result[extra_idx][0]
                 extra_idx += 1
             if log_entropy:
                 gate_entropy, target_entropy, num_candidates = (x.item() for x in result[extra_idx:extra_idx + 3])
-                extra_idx += 3
+
+            troop_ratio_now = float(scalar[1])
+            tile_fraction_now = float(scalar[2])
+            incoming_ratio_now = float(scalar[4])
 
             if log_probs:
-                # do_nothing is always the last row build_entities appends - unless
-                # truncated away by pad_entities when >MAX_ENTITIES candidates existed,
-                # in which case it wasn't a selectable action this tick at all.
+                # do_nothing may be missing if pad_entities truncated it away
                 do_nothing_rows = np.where(entity_features[:, 3] == 1.0)[0]
                 do_nothing_idx = int(do_nothing_rows[0]) if len(do_nothing_rows) and do_nothing_rows[0] < len(probs) else None
                 p_do_nothing = probs[do_nothing_idx].item() if do_nothing_idx is not None else None
-                n_candidates = len(targets)
-                troop_ratio_now = float(scalar[1])
-                incoming_ratio_now = float(scalar[4])
-
                 if p_do_nothing is not None:
                     prob_samples.append((troop_ratio_now, p_do_nothing))
 
@@ -204,8 +145,6 @@ def main(
 
                 if i % prob_log_interval == 0:
                     p_str = "n/a(truncated)" if p_do_nothing is None else f"{p_do_nothing:.3f}"
-                    # what's actually being attacked - is_tribe/is_nation/is_wilderness,
-                    # tile_fraction, troop_ratio (see ENTITY_FEATURES order in action_space.py)
                     target_str = ""
                     if target is not DO_NOTHING and action_idx < len(entity_features):
                         row = entity_features[action_idx]
@@ -217,16 +156,13 @@ def main(
                             f"incoming_ratio={incoming_ratio_now:.3f} same_target_as_prev_attack={same_target_str}"
                         )
                     print(
-                        f"[prob] tick={i} troop_ratio={troop_ratio_now:.3f} n_candidates={n_candidates} "
+                        f"[prob] tick={i} troop_ratio={troop_ratio_now:.3f} n_candidates={len(targets)} "
                         f"p_do_nothing={p_str} p_attack={'n/a' if p_do_nothing is None else f'{1 - p_do_nothing:.3f}'} "
                         f"chosen={chosen}{target_str}"
                     )
 
             if log_value:
                 value_now = value.item()
-                troop_ratio_now = float(scalar[1])
-                tile_fraction_now = float(scalar[2])
-                incoming_ratio_now = float(scalar[4])
                 value_samples.append((i, value_now, troop_ratio_now, tile_fraction_now, incoming_ratio_now))
                 if i % value_log_interval == 0:
                     print(
@@ -237,10 +173,6 @@ def main(
             if log_entropy:
                 entropy_samples.append((num_candidates, gate_entropy, target_entropy))
                 if i % entropy_log_interval == 0:
-                    # ceiling = log(num_candidates) - target_entropy's max possible value
-                    # if the distribution were perfectly uniform over that many candidates.
-                    # target_entropy/ceiling near 1.0 across every nations count means the
-                    # rise is purely "more candidates to spread over," not less confidence.
                     ceiling = np.log(num_candidates) if num_candidates > 1 else float("nan")
                     ratio_str = "n/a" if np.isnan(ceiling) or ceiling == 0 else f"{target_entropy / ceiling:.3f}"
                     print(
@@ -250,28 +182,22 @@ def main(
                     )
 
             if diagnostic:
-                troop_ratio = float(scalar[1])
-                tile_fraction = float(scalar[2])
                 if target is DO_NOTHING:
                     do_nothing_ticks += 1
                 else:
                     attack_ticks += 1
-                    attack_troop_ratios.append(troop_ratio)
+                    attack_troop_ratios.append(troop_ratio_now)
                     if first_attack_tick is None:
                         first_attack_tick = i
-                        first_attack_troop_ratio = troop_ratio
-                if tile_fraction > peak_tile_fraction:
-                    peak_tile_fraction = tile_fraction
+                        first_attack_troop_ratio = troop_ratio_now
+                if tile_fraction_now > peak_tile_fraction:
+                    peak_tile_fraction = tile_fraction_now
                     peak_tick = i
 
-            troops = None if size_frac is None else size_frac * episode.player_stats.get(episode.agent_small_id, {}).get("troops", 0.0)
+            troops = size_frac * episode.player_stats.get(episode.agent_small_id, {}).get("troops", 0.0)
             intents = action_to_intents(target=target, agent_client_id=episode.agent_client_id, troops=troops)
             step_result = bridge.step(intents)
 
-            # apply_step's own eliminated/done check (mirrors train.py's - see its
-            # docstring) covers the same "don't keep observing a dead agent" case this
-            # used to compute locally; done here folds in eliminated the same way.
-            # Mutates episode.spatial/scalar/targets in place - re-read them below.
             entity_features, _prev_stats, curr_stats, done, _won = apply_step(episode, step_result)
             spatial, scalar, targets = episode.spatial, episode.scalar, episode.targets
             apply_unit_updates(units, step_result["unitUpdates"])
@@ -287,9 +213,7 @@ def main(
                 draw_units(img, units, width, scale)
                 draw_troop_counts(img, episode.owner_grid, episode.land_mask, episode.player_stats, episode.agent_small_id, scale)
                 cv2.imshow("map", outline_agent_territory(img, episode.owner_grid, episode.agent_small_id, scale))
-                # waitKey also pumps the window's event loop - required for it to
-                # actually repaint, not just a keypress wait.
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                if cv2.waitKey(1) & 0xFF == ord("q"):  # waitKey also repaints the window
                     break
 
             if done:
@@ -309,50 +233,26 @@ def main(
 
         if log_value and len(value_samples) > 1:
             ticks, values, ratios, tile_fracs, incoming_ratios = (np.array(x) for x in zip(*value_samples))
-            corr_tick = np.corrcoef(ticks, values)[0, 1]
-            corr_ratio = np.corrcoef(ratios, values)[0, 1]
-            corr_tile = np.corrcoef(tile_fracs, values)[0, 1]
             corr_incoming = np.corrcoef(incoming_ratios, values)[0, 1] if incoming_ratios.std() > 0 else float("nan")
             print(
                 f"[value-summary] seed={seed} n={len(value_samples)} "
-                f"corr(V,tick)={corr_tick:.3f} corr(V,troop_ratio)={corr_ratio:.3f} "
-                f"corr(V,tile_fraction)={corr_tile:.3f} corr(V,incoming_ratio)={corr_incoming:.3f}"
+                f"corr(V,tick)={np.corrcoef(ticks, values)[0, 1]:.3f} "
+                f"corr(V,troop_ratio)={np.corrcoef(ratios, values)[0, 1]:.3f} "
+                f"corr(V,tile_fraction)={np.corrcoef(tile_fracs, values)[0, 1]:.3f} corr(V,incoming_ratio)={corr_incoming:.3f}"
             )
 
         if log_probs and prob_samples:
-            # bucket by troop_ratio decile - a real "wait when low" policy should show
-            # p_do_nothing falling as the ratio climbs; a dilution-bound one stays flat.
-            buckets = [[] for _ in range(10)]
-            for ratio, p in prob_samples:
-                idx = min(int(ratio * 10), 9)
-                buckets[idx].append(p)
-            print(f"[prob-summary] seed={seed}")
-            for b, ps in enumerate(buckets):
-                if ps:
-                    print(f"  troop_ratio [{b/10:.1f},{(b+1)/10:.1f}): n={len(ps):5d} mean_p_do_nothing={sum(ps)/len(ps):.3f}")
+            _print_bucketed(
+                f"[prob-summary] seed={seed}", prob_samples,
+                lambda rows: f"mean_p_do_nothing={sum(r[1] for r in rows) / len(rows):.3f}",
+            )
 
         if log_probs and attack_context_samples:
-            # same bucketing, but only over ticks an attack was actually chosen -
-            # answers *why* the low-ratio bucket keeps attacking: repeatedly finishing
-            # off the same target (same_target_frac high, still costly per-tick but not
-            # reckless) vs. scattering across different ones (same_target_frac low, the
-            # actual spam failure) vs. defensive reflex under active invasion
-            # (mean_incoming_ratio high).
-            ctx_buckets = [[] for _ in range(10)]
-            for ratio, incoming, same in attack_context_samples:
-                idx = min(int(ratio * 10), 9)
-                ctx_buckets[idx].append((incoming, same))
-            print(f"[attack-context-summary] seed={seed}")
-            for b, rows in enumerate(ctx_buckets):
-                if rows:
-                    incomings = [r[0] for r in rows]
-                    knowns = [r[1] for r in rows if r[1] is not None]
-                    same_frac_str = "n/a" if not knowns else f"{sum(knowns) / len(knowns):.3f}"
-                    print(
-                        f"  troop_ratio [{b/10:.1f},{(b+1)/10:.1f}): n={len(rows):5d} "
-                        f"mean_incoming_ratio={sum(incomings)/len(incomings):.3f} "
-                        f"same_target_frac={same_frac_str} (n_known={len(knowns)})"
-                    )
+            def context_str(rows):
+                knowns = [r[2] for r in rows if r[2] is not None]
+                same_frac = "n/a" if not knowns else f"{sum(knowns) / len(knowns):.3f}"
+                return f"mean_incoming_ratio={sum(r[1] for r in rows) / len(rows):.3f} same_target_frac={same_frac} (n_known={len(knowns)})"
+            _print_bucketed(f"[attack-context-summary] seed={seed}", attack_context_samples, context_str)
 
         if log_entropy and entropy_samples:
             candidates, gate_ents, target_ents = (np.array(x) for x in zip(*entropy_samples))
@@ -400,23 +300,23 @@ if __name__ == "__main__":
     parser.add_argument("--seed", default="seedseed", help="comma-separated for multiple runs")
     parser.add_argument("--scale", type=int, default=2)
     parser.add_argument("--headless", action="store_true", help="skip the cv2 window")
-    parser.add_argument("--diagnostic", action="store_true", help="log troop_ratio/action stats and print an end-of-game summary")
-    parser.add_argument("--log-probs", action="store_true", help="log p(do_nothing) vs p(attack) per tick plus a troop_ratio-bucketed summary")
-    parser.add_argument("--prob-log-interval", type=int, default=1, help="print a [prob] line every N ticks (only with --log-probs)")
-    parser.add_argument("--log-value", action="store_true", help="log V(s) per tick plus corr(V,tick)/corr(V,troop_ratio)/corr(V,tile_fraction)")
-    parser.add_argument("--value-log-interval", type=int, default=1, help="print a [value] line every N ticks (only with --log-value)")
-    parser.add_argument("--log-entropy", action="store_true", help="log gate_entropy vs target_entropy vs num_candidates per tick - disentangles a less-confident gate from a target_dist that just has more candidates to spread over (structural, scales with nations count)")
-    parser.add_argument("--entropy-log-interval", type=int, default=1, help="print an [entropy] line every N ticks (only with --log-entropy)")
-    parser.add_argument("--bots", type=int, default=BOTS, help=f"defaults to train.py's current BOTS ({BOTS}) - keep in sync with what the checkpoint was actually trained against")
-    parser.add_argument("--nations", type=int, default=NATIONS, help=f"defaults to train.py's current NATIONS ({NATIONS})")
-    parser.add_argument("--difficulty", default=DIFFICULTY, help=f"defaults to train.py's current DIFFICULTY ({DIFFICULTY})")
-    parser.add_argument("--max-ticks", type=int, default=None, help="stop early after N ticks - for fast cross-checkpoint probing instead of playing out a full game")
-    parser.add_argument("--map", dest="map_name", default="mid_plains", help="defaults to train.py's current map (mid_plains) - checkpoint wasn't trained on other maps, so results are exploratory")
+    parser.add_argument("--diagnostic", action="store_true", help="print per-game action stats and, over several seeds, an aggregate")
+    parser.add_argument("--log-probs", action="store_true", help="log p(do_nothing) per tick plus troop-ratio-bucketed summaries")
+    parser.add_argument("--prob-log-interval", type=int, default=1, help="print a [prob] line every N ticks")
+    parser.add_argument("--log-value", action="store_true", help="log V(s) per tick plus its correlations")
+    parser.add_argument("--value-log-interval", type=int, default=1, help="print a [value] line every N ticks")
+    parser.add_argument("--log-entropy", action="store_true", help="log gate and target entropy per tick")
+    parser.add_argument("--entropy-log-interval", type=int, default=1, help="print an [entropy] line every N ticks")
+    parser.add_argument("--bots", type=int, default=BOTS)
+    parser.add_argument("--nations", type=int, default=NATIONS)
+    parser.add_argument("--difficulty", default=DIFFICULTY)
+    parser.add_argument("--max-ticks", type=int, default=None, help="stop early after N ticks")
+    parser.add_argument("--map", dest="map_name", default="mid_plains")
     args = parser.parse_args()
 
     checkpoint_path = args.checkpoint or latest_checkpoint()
     if checkpoint_path is None:
-        raise SystemExit("no checkpoint found in runs/checkpoints/default/ - train first")
+        raise SystemExit("no checkpoint found - train first")
 
     seeds = args.seed.split(",")
     summaries = []

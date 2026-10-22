@@ -1,19 +1,9 @@
-"""Anchor buffer: a small ring buffer of individual timesteps sampled from states where
-troop_ratio was high and the outcome from there was good (positive advantage) - the
-opposite tail of train.py's LOW_RATIO_THRESHOLD diagnostic.
+"""Ring buffer of single timesteps, used twice in train.py: as an anchor buffer of
+high-troop-ratio states that led to good returns (self-imitation), and as a low-ratio
+buffer that keeps the value head calibrated on depleted states.
 
-Motivation (see CLAUDE.md's "state-visitation narrowing" finding): during a collapse,
-frac_low_ratio climbs toward 80%+, meaning PPO's on-policy rollout stops containing the
-patient/high-ratio trajectories that actually win - there is nothing left in the training
-data to reinforce recovering to that regime. This buffer keeps a standing library of such
-states across updates so a small self-imitation step (Oh et al. 2018) can keep training
-against them even while the current rollout is dominated by low-ratio states.
-
-Deliberately NOT a PPO/importance-sampled replay - see train.py's use of this buffer for
-why: the loss here is supervised toward a fixed (state, action, return) triple, weighted
-by max(0, return - V(s)) with the weight detached, so an old anchor never needs an
-importance-sampling correction the way a PPO-style update over stale data would (that
-staleness problem is what the deleted self_imitation.py's SIL_MAX_AGE_UPDATES was for).
+The anchor loss is supervised toward a fixed (state, action, return) triple, weighted by
+max(0, return - V(s)) with the weight detached, so old entries need no importance correction.
 """
 
 import random
@@ -46,7 +36,7 @@ class AnchorBuffer:
         scalar: np.ndarray, entities: np.ndarray, entity_mask: np.ndarray,
         action: float, ret: float, update: int,
     ) -> None:
-        """Ring-buffer insert - overwrites the oldest slot once full."""
+        """Overwrites the oldest slot once full."""
         bool_planes = bool_planes.copy()
         owner_grid = owner_grid.copy()
         ratio_table = ratio_table.copy()
@@ -84,17 +74,9 @@ class AnchorBuffer:
         high_ratio_threshold: float, update: int, max_insertions: int,
         high_ratio_ceiling: float = float("inf"),
     ) -> int:
-        """Selects candidate timesteps (threshold <= troop_ratio <= ceiling, positive raw
-        advantage) from one flattened rollout and inserts a capped random subsample - see
-        module docstring. Returns the number actually inserted, for logging.
-
-        high_ratio_ceiling (2026-10-10): without an upper bound, this buffer's own
-        self-imitation pull has no way to tell "waited a healthy amount" from "waited
-        way past the point of diminishing returns" - whatever ratio the live policy's
-        good outcomes happen to cluster at gets reinforced as more buffer entries,
-        pushing the next policy to wait even longer for its own good outcomes, a
-        ratchet with no ceiling. Bounding insertion to a band around TROOP_RATIO_TARGET
-        stops the buffer from rewarding arbitrarily long delays."""
+        """Inserts a capped random sample of timesteps with a troop ratio inside
+        [high_ratio_threshold, high_ratio_ceiling] and positive raw advantage.
+        The ceiling stops the buffer rewarding ever-longer waits. Returns the number inserted."""
         candidates = np.nonzero(
             (scalar_buf[:, 1] >= high_ratio_threshold) & (scalar_buf[:, 1] <= high_ratio_ceiling)
             & (raw_advantages > 0)
@@ -118,10 +100,8 @@ class AnchorBuffer:
         actions: np.ndarray, returns: np.ndarray,
         low_ratio_threshold: float, update: int, max_insertions: int,
     ) -> int:
-        """Selects candidate timesteps (troop_ratio < threshold) regardless of outcome
-        or advantage sign - keeps the value head calibrated on this tail even once a
-        winning streak makes it rare in the live rollout (see CLAUDE.md's value-
-        calibration-narrowing finding). Otherwise identical to insert_from_rollout."""
+        """Inserts a capped random sample of timesteps below low_ratio_threshold,
+        whatever the outcome. Returns the number inserted."""
         candidates = np.nonzero(scalar_buf[:, 1] < low_ratio_threshold)[0]
         if candidates.size == 0:
             return 0
@@ -136,9 +116,7 @@ class AnchorBuffer:
         return int(candidates.size)
 
     def evict_older_than(self, update: int, max_age_updates: int) -> None:
-        """Loose safety-valve eviction, not a correctness requirement - see module
-        docstring on why staleness doesn't invalidate an anchor the way it would for a
-        PPO-style replay. Rebuilds the list in place, dropping anything too old."""
+        """Drops entries older than max_age_updates."""
         keep = [i for i, t in enumerate(self.inserted_at) if update - t <= max_age_updates]
         if len(keep) == len(self.inserted_at):
             return
@@ -154,8 +132,7 @@ class AnchorBuffer:
         self._next_slot = len(keep)
 
     def sample(self, batch_size: int) -> dict | None:
-        """Returns a dict of stacked numpy arrays for a random minibatch, or None if
-        the buffer doesn't have enough anchors yet."""
+        """A random minibatch as stacked numpy arrays, or None if the buffer is empty."""
         n = len(self)
         if n == 0:
             return None
