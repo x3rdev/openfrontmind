@@ -13,7 +13,7 @@ import numpy as np
 
 # [is_tribe, is_nation, is_wilderness, is_do_nothing, tile_fraction, log_gold, troop_ratio,
 #  attacking_me_ratio, already_attacking]
-ENTITY_FEATURES = 9
+ENTITY_FEATURES = 10
 
 # Buffer-size cap, not a meaningful-identity cap like the old ATTACK_SLOTS - truncation
 # just means "ignore the least-relevant excess candidates this one tick," not "this
@@ -26,7 +26,8 @@ DO_NOTHING = object()
 
 
 def build_entities(
-    attack_mask: list, player_stats: dict, player_types: dict, total_land: float
+    attack_mask: list, player_stats: dict, player_types: dict, total_land: float,
+    agent_ratio: float = 0.0,
 ) -> tuple[np.ndarray, list]:
     """Turn attackMask + current player stats into (features, targets).
 
@@ -65,13 +66,14 @@ def build_entities(
                 troop_ratio,
                 attacking_me_ratio,
                 already_attacking,
+                agent_ratio - troop_ratio,
             ])
             targets.append(c["targetID"])
         else:
-            rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, already_attacking])
+            rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, already_attacking, 0.0])
             targets.append(None)
 
-    rows.append([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    rows.append([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     targets.append(DO_NOTHING)
 
     return np.array(rows, dtype=np.float32), targets
@@ -88,9 +90,9 @@ def pad_entities(features: np.ndarray, max_n: int = MAX_ENTITIES) -> tuple[np.nd
     return padded, mask
 
 
-def action_to_intents(target, agent_client_id: str) -> list[dict]:
+def action_to_intents(target, agent_client_id: str, troops: float | None = None) -> list[dict]:
     """Turn a chosen candidate's target (from `targets`, indexed by the sampled
     action) into an intents list for bridge.step()."""
     if target is DO_NOTHING:
         return []
-    return [{"type": "attack", "targetID": target, "troops": None, "clientID": agent_client_id}]
+    return [{"type": "attack", "targetID": target, "troops": troops, "clientID": agent_client_id}]

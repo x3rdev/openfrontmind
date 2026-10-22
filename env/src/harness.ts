@@ -235,7 +235,7 @@ const WILDERNESS_KEY = "__wilderness__";
 function computeAttackMask(
   game: ReturnType<typeof createGame>,
   agentClientID: string,
-): { attackMask: AttackTarget[]; outgoingTroops: number; incomingTroops: number } {
+): { attackMask: AttackTarget[];  outgoingTroops: number; incomingTroops: number } {
   const agent = game.playerByClientID(agentClientID);
   if (agent === null) return { attackMask: [], outgoingTroops: 0, incomingTroops: 0 };
 

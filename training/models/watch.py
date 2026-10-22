@@ -1,4 +1,5 @@
 import argparse
+import os
 import zlib
 from pathlib import Path
 
@@ -11,8 +12,8 @@ from training.envs.map_view import draw_troop_counts, draw_units, outline_agent_
 from training.envs.observation import encode_observation
 from training.envs.action_space import build_entities, pad_entities, action_to_intents, DO_NOTHING
 from training.envs.running_stats import RunningMeanStd
-from training.models.policy import Agent
-from training.models.train import latest_checkpoint, BOTS, NATIONS, DIFFICULTY
+from training.models.policy import Agent, TAUS
+from training.models.train import DEC_INTERRUPT, DEC_WAIT_CAP, DEC_INCOMING_JUMP, latest_checkpoint, BOTS, NATIONS, DIFFICULTY
 
 
 def main(
@@ -63,6 +64,14 @@ def main(
             spatial=spatial, scalar=scalar, entities=entities, entity_mask=entity_mask, targets=targets,
         )
 
+        decision = "tau_head.weight" in checkpoint["model"]
+        if "size_head.weight" in checkpoint["model"]:
+            os.environ["OFM_SIZE"] = "1"
+        if decision:
+            os.environ["OFM_DECISION"] = "1"
+            if log_probs or log_entropy:
+                raise SystemExit("--log-probs/--log-entropy unsupported for decision-mode checkpoints")
+        phase, tau, wait, inc_ref = 0, 0.0, 0, 0.0
         agent = Agent.from_observation(spatial, scalar, entities)
         # shape mismatches (e.g. entity_dim growing) still raise under strict=False - drop
         # those keys so they init fresh instead of failing the load, same as train.py
@@ -98,6 +107,18 @@ def main(
         # answers "does p(wait) actually track troop_ratio, or is it flat/dilution-bound".
         prob_samples = []
 
+        # 2026-09-24: distinguishes two failure modes that look identical in
+        # mean_attack_troop_ratio alone - chasing the same target tick after tick
+        # (finishing off an in-progress conquest, still costly per-tick since attacks
+        # never merge - see AttackExecution notes in CLAUDE.md - but not reckless) vs.
+        # scattering across different targets while critically depleted (the actual
+        # "greedy, not patient" spam failure). (troop_ratio, incoming_ratio,
+        # same_target_as_previous_attack) - the last is None when either this or the
+        # previous attack targeted wilderness (targetID is always None there, so
+        # identity can't be compared) or this is the first attack of the game.
+        attack_context_samples = []
+        prev_attack_target = None
+
         # (tick, value, troop_ratio, tile_fraction, incoming_ratio) - answers "is V(s)
         # state-aware, or is it just fitting a smooth curve against elapsed tick number"
         # (see CLAUDE.md's earlier value-trace finding, from before troop_ratio was in
@@ -113,18 +134,40 @@ def main(
         entropy_samples = []
 
         for i in range(int(1.0e100)):
-            with torch.no_grad():
-                result = agent.get_action_and_value(
-                    spatial=torch.from_numpy(spatial).unsqueeze(0),
-                    scalar=torch.from_numpy(scalar).unsqueeze(0),
-                    entities=torch.from_numpy(entities).unsqueeze(0),
-                    entity_mask=torch.from_numpy(entity_mask).unsqueeze(0),
-                    action=None,
-                    return_probs=log_probs,
-                    return_entropy_components=log_entropy,
-                )
-            action, log_prob, entropy, value = result[:4]
-            action_idx = action.item()
+            size_frac = None
+            if decision:
+                with torch.no_grad():
+                    tau_a, _, tgt_a, _, value, can_act = agent.act_decision(
+                        torch.from_numpy(spatial).unsqueeze(0), torch.from_numpy(scalar).unsqueeze(0),
+                        torch.from_numpy(entities).unsqueeze(0), torch.from_numpy(entity_mask).unsqueeze(0),
+                    )
+                action_idx = len(targets)
+                resample = phase == 0
+                if phase == 1:
+                    if scalar[1] >= tau and can_act.item():
+                        action_idx, phase = tgt_a.item(), 0
+                    else:
+                        wait += 1
+                        resample = DEC_INTERRUPT and (wait >= DEC_WAIT_CAP or scalar[4] - inc_ref >= DEC_INCOMING_JUMP)
+                if resample:
+                    tau, phase, wait, inc_ref = TAUS[tau_a.item()], 1, 0, float(scalar[4])
+                value = value.squeeze()
+            else:
+                with torch.no_grad():
+                    result = agent.get_action_and_value(
+                        spatial=torch.from_numpy(spatial).unsqueeze(0),
+                        scalar=torch.from_numpy(scalar).unsqueeze(0),
+                        entities=torch.from_numpy(entities).unsqueeze(0),
+                        entity_mask=torch.from_numpy(entity_mask).unsqueeze(0),
+                        action=None,
+                        return_probs=log_probs,
+                        return_entropy_components=log_entropy,
+                    )
+                action, log_prob, entropy, value = result[:4]
+                action_idx = action.item()
+                if agent.use_size:
+                    size_frac = action.item() - int(np.floor(action.item()))
+                    action_idx = int(np.floor(action.item()))
             target = targets[action_idx] if action_idx < len(targets) else DO_NOTHING
 
             # positional, not fixed indices - matches policy.py's append order (probs
@@ -146,12 +189,20 @@ def main(
                 p_do_nothing = probs[do_nothing_idx].item() if do_nothing_idx is not None else None
                 n_candidates = len(targets)
                 troop_ratio_now = float(scalar[1])
+                incoming_ratio_now = float(scalar[4])
 
                 if p_do_nothing is not None:
                     prob_samples.append((troop_ratio_now, p_do_nothing))
 
+                chosen = "do_nothing" if target is DO_NOTHING else "attack"
+                same_target = None
+                if chosen == "attack":
+                    if target is not None and prev_attack_target is not None:
+                        same_target = target == prev_attack_target
+                    attack_context_samples.append((troop_ratio_now, incoming_ratio_now, same_target))
+                    prev_attack_target = target
+
                 if i % prob_log_interval == 0:
-                    chosen = "do_nothing" if target is DO_NOTHING else "attack"
                     p_str = "n/a(truncated)" if p_do_nothing is None else f"{p_do_nothing:.3f}"
                     # what's actually being attacked - is_tribe/is_nation/is_wilderness,
                     # tile_fraction, troop_ratio (see ENTITY_FEATURES order in action_space.py)
@@ -159,9 +210,11 @@ def main(
                     if target is not DO_NOTHING and action_idx < len(entity_features):
                         row = entity_features[action_idx]
                         kind = "tribe" if row[0] else "nation" if row[1] else "wilderness" if row[2] else "?"
+                        same_target_str = "n/a" if same_target is None else str(same_target)
                         target_str = (
                             f" target_kind={kind} target_tile_fraction={row[4]:.3f} "
-                            f"target_troop_ratio={row[6]:.3f} target_attacking_me_ratio={row[7]:.3f}"
+                            f"target_troop_ratio={row[6]:.3f} target_attacking_me_ratio={row[7]:.3f} "
+                            f"incoming_ratio={incoming_ratio_now:.3f} same_target_as_prev_attack={same_target_str}"
                         )
                     print(
                         f"[prob] tick={i} troop_ratio={troop_ratio_now:.3f} n_candidates={n_candidates} "
@@ -211,7 +264,8 @@ def main(
                     peak_tile_fraction = tile_fraction
                     peak_tick = i
 
-            intents = action_to_intents(target=target, agent_client_id=episode.agent_client_id)
+            troops = None if size_frac is None else size_frac * episode.player_stats.get(episode.agent_small_id, {}).get("troops", 0.0)
+            intents = action_to_intents(target=target, agent_client_id=episode.agent_client_id, troops=troops)
             step_result = bridge.step(intents)
 
             # apply_step's own eliminated/done check (mirrors train.py's - see its
@@ -277,6 +331,29 @@ def main(
                 if ps:
                     print(f"  troop_ratio [{b/10:.1f},{(b+1)/10:.1f}): n={len(ps):5d} mean_p_do_nothing={sum(ps)/len(ps):.3f}")
 
+        if log_probs and attack_context_samples:
+            # same bucketing, but only over ticks an attack was actually chosen -
+            # answers *why* the low-ratio bucket keeps attacking: repeatedly finishing
+            # off the same target (same_target_frac high, still costly per-tick but not
+            # reckless) vs. scattering across different ones (same_target_frac low, the
+            # actual spam failure) vs. defensive reflex under active invasion
+            # (mean_incoming_ratio high).
+            ctx_buckets = [[] for _ in range(10)]
+            for ratio, incoming, same in attack_context_samples:
+                idx = min(int(ratio * 10), 9)
+                ctx_buckets[idx].append((incoming, same))
+            print(f"[attack-context-summary] seed={seed}")
+            for b, rows in enumerate(ctx_buckets):
+                if rows:
+                    incomings = [r[0] for r in rows]
+                    knowns = [r[1] for r in rows if r[1] is not None]
+                    same_frac_str = "n/a" if not knowns else f"{sum(knowns) / len(knowns):.3f}"
+                    print(
+                        f"  troop_ratio [{b/10:.1f},{(b+1)/10:.1f}): n={len(rows):5d} "
+                        f"mean_incoming_ratio={sum(incomings)/len(incomings):.3f} "
+                        f"same_target_frac={same_frac_str} (n_known={len(knowns)})"
+                    )
+
         if log_entropy and entropy_samples:
             candidates, gate_ents, target_ents = (np.array(x) for x in zip(*entropy_samples))
             ceilings = np.log(np.maximum(candidates, 1))
@@ -339,7 +416,7 @@ if __name__ == "__main__":
 
     checkpoint_path = args.checkpoint or latest_checkpoint()
     if checkpoint_path is None:
-        raise SystemExit("no checkpoint found in training/models/checkpoints/ - train first")
+        raise SystemExit("no checkpoint found in runs/checkpoints/default/ - train first")
 
     seeds = args.seed.split(",")
     summaries = []

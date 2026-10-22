@@ -53,6 +53,13 @@ class EpisodeState:
     entity_mask: np.ndarray
     targets: list
     ticks: int = 0
+    peak: float = 0.0
+    difficulty: str = ""
+    phi: float | None = None
+    phase: int = 0
+    tau: float = 0.0
+    wait: int = 0
+    inc_ref: float = 0.0
 
 
 def apply_tile_updates(
@@ -196,7 +203,8 @@ def apply_step(episode: EpisodeState, step_result: dict) -> tuple[np.ndarray, di
         step_result["outgoingTroops"], step_result["incomingTroops"],
     )
     entity_features, episode.targets = build_entities(
-        step_result["attackMask"], episode.player_stats, episode.player_types, total_land
+        step_result["attackMask"], episode.player_stats, episode.player_types, total_land,
+        agent_ratio=curr_stats.get("troops", 0.0) / max(curr_stats.get("maxTroops", 1.0), 1),
     )
 
     return entity_features, prev_stats, curr_stats, done, won

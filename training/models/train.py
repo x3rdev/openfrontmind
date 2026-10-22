@@ -14,9 +14,11 @@ from training.envs.vec_bridge import VecOpenFrontBridge
 from training.envs.game_state import EpisodeState, new_masks, apply_reset, apply_step
 from training.envs.observation import encode_observation, reconstruct_spatial_torch, MAX_SMALL_ID
 from training.envs.action_space import build_entities, pad_entities, action_to_intents, DO_NOTHING
-from training.envs.reward import compute_reward
+from training.envs.reward import (
+    TROOP_DEPLETION_COEF, compute_reward, compute_reward_blend, compute_reward_logratio, strongest_adjacent_troops,
+)
 from training.envs.running_stats import RunningMeanStd
-from training.models.policy import Agent
+from training.models.policy import Agent, TAUS
 from training.models.anchor_buffer import AnchorBuffer
 
 
@@ -91,10 +93,11 @@ BOTS = 0
 # 2026-10-11: nations=3 held 68-85% for 100+ updates on both members after the
 # from_default restart; bumping to 4, warm-started from its update128 checkpoint.
 # 2026-10-12: back to 3 - n4-only sat at ~0% wins for 300+ updates and eroded the policy.
-NATIONS_MIN = 3
-NATIONS_MAX = 3
+NATIONS_MIN = int(os.environ.get("OFM_NATIONS", "5"))
+NATIONS_MAX = NATIONS_MIN
 NATIONS = NATIONS_MAX  # single-value fallback for watch.py's default
-DIFFICULTY = "Easy"  # set explicitly so it can't silently drift (default was Easy anyway)
+DIFFICULTIES = os.environ.get("OFM_DIFFICULTY", "Easy").split(",")  # one drawn per episode; repeat a name to weight it
+DIFFICULTY = DIFFICULTIES[0]  # set explicitly so it can't silently drift (default was Easy anyway)
 
 # Experiment (2026-08-22): fixed 16-seed pool instead of fully random. Result: negative
 # - in-pool win rate stayed noisy/flat (same range as free-random seeds, no faster
@@ -118,6 +121,29 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 OFM_ABLATION = os.environ.get("OFM_ABLATION", "control")
 assert OFM_ABLATION in ("control", "fixed_entropy", "no_anchor"), f"unknown OFM_ABLATION={OFM_ABLATION!r}"
 FIXED_ENTROPY_COEF = float(os.environ.get("OFM_FIXED_ENTROPY_COEF", "0.08"))
+# comma-separated per-member override of FIXED_ENTROPY_COEF (e.g. "0.08,0.02") for A/B runs
+MEMBER_ENTROPY_COEFS = [float(x) for x in os.environ.get("OFM_MEMBER_ENTROPY_COEFS", "").split(",") if x]
+# disables PBT exploit/explore so members stay independent lineages in an A/B
+PBT_DISABLED = os.environ.get("OFM_PBT_DISABLE", "0") == "1"
+# critic regression clip: "raw" = +-CLIP_EPS in raw value units (legacy), "scaled" = x return_std, "none"
+VALUE_CLIP_MODE = os.environ.get("OFM_VALUE_CLIP", "raw")
+assert VALUE_CLIP_MODE in ("raw", "scaled", "none")
+MEMBER_VALUE_CLIP = [x for x in os.environ.get("OFM_MEMBER_VALUE_CLIP", "").split(",") if x]
+MEMBER_GAE_LAMBDA = [float(x) for x in os.environ.get("OFM_MEMBER_GAE_LAMBDA", "").split(",") if x]
+# GAE lambda used only for the critic's regression targets (policy advantages keep GAE_LAMBDA)
+MEMBER_VALUE_LAMBDA = [float(x) for x in os.environ.get("OFM_MEMBER_VALUE_LAMBDA", "").split(",") if x]
+MEMBER_ANCHOR_COEF = [float(x) for x in os.environ.get("OFM_MEMBER_ANCHOR_COEF", "").split(",") if x]
+MEMBER_DETACH_GATE_ENTROPY = [x == "1" for x in os.environ.get("OFM_MEMBER_DETACH_GATE_ENTROPY", "").split(",") if x]
+MEMBER_DEPLETION_COEF = [float(x) for x in os.environ.get("OFM_MEMBER_DEPLETION_COEF", "").split(",") if x]
+MEMBER_REWARD_MODE = [x for x in os.environ.get("OFM_MEMBER_REWARD_MODE", "").split(",") if x]
+MEMBER_DECISION = [x == "1" for x in os.environ.get("OFM_MEMBER_DECISION", "").split(",") if x]
+GATE_KL_COEF = float(os.environ.get("OFM_GATE_KL", "0"))
+DEC_INTERRUPT = os.environ.get("OFM_DEC_INTERRUPT", "1") == "1"
+DEC_WAIT_CAP = int(os.environ.get("OFM_DEC_WAIT_CAP", "200"))
+DEC_INCOMING_JUMP = float(os.environ.get("OFM_DEC_INCOMING_JUMP", "0.03"))
+DEC_EPOCHS = int(os.environ.get("OFM_DEC_EPOCHS", "4"))
+DEC_MINIBATCH = int(os.environ.get("OFM_DEC_MINIBATCH", "128"))
+MEMBER_SEPARATE_CRITIC = [x == "1" for x in os.environ.get("OFM_MEMBER_SEPARATE_CRITIC", "").split(",") if x]
 
 # 2026-10-06: runtime artifacts (checkpoints/logs/state) live under a top-level runs/
 # directory, not inside training/models/ alongside source - keeps the source tree
@@ -219,7 +245,9 @@ LR_WARMUP_UPDATES = 16
 # nations=2 phase - see CLAUDE.md/session log.
 GAMMA = 1 - 1 / STEPS
 GAE_LAMBDA = 0.95
-PPO_EPOCHS = 4
+# 2026-10-13: 4->2. At 10 envs, 4 epochs = ~1000 steps/update (weight_delta_l2 ~7 vs ~4.2 at 4 envs)
+# and n3 members decayed; 2 epochs ~ the ~400 steps/update of the 4-env runs that held.
+PPO_EPOCHS = 2
 MINIBATCH_SIZE = 256
 CLIP_EPS = 0.2
 # was 0.5, then 5.0 - the 10x jump was too aggressive: entropy collapsed to ~0.0000
@@ -352,7 +380,7 @@ LOW_RATIO_COEF = 0.02
 # overridable via env var - the 2026-09-03 crash-reproducibility experiment runs
 # POP_SIZE=1 (single lineage, PBT's exploit/explore trivially no-ops with one member)
 # to isolate whether a crash reproduces without PBT's own dynamics as a confound.
-POP_SIZE = int(os.environ.get("OFM_POP_SIZE", "2"))
+POP_SIZE = int(os.environ.get("OFM_POP_SIZE", "1"))
 # 2026-10-07: measured real peak RSS (not just buffer math, which underestimated this
 # badly - it only accounted for the rollout buffers' own growth, missing that the PPO
 # phase's minibatch tensors also scale with total data collected) across three
@@ -460,7 +488,11 @@ class Rollout:
     episode_end_golds_win: list[float]
     episode_end_golds_loss: list[float]
     wins_by_nations: dict[int, list[int]]
+    end_structs_win: list[dict]
+    end_structs_loss: list[dict]
+    end_records: list[tuple]
     elapsed: float
+    dec_type: np.ndarray | None = None
 
 
 def _apply_gold_stats(scalar: np.ndarray, entity_features: np.ndarray, gold_stats: RunningMeanStd) -> None:
@@ -511,14 +543,17 @@ def _episode_state_from_setup(setup: dict, gold_stats: RunningMeanStd) -> Episod
 
 def start_episode(bridge, gold_stats: RunningMeanStd) -> EpisodeState:
     """Used for standalone scripts and per-slot resets in collect_rollout."""
+    difficulty = random.choice(DIFFICULTIES)
     setup = bridge.reset(
         seed=random.choice(SEED_POOL) if SEED_POOL else str(random.randint(0, 2 ** 31 - 1)),
         map="mid_plains",
         bots=BOTS,
         nations=random.randint(NATIONS_MIN, NATIONS_MAX),
-        difficulty=DIFFICULTY,
+        difficulty=difficulty,
     )
-    return _episode_state_from_setup(setup, gold_stats)
+    episode = _episode_state_from_setup(setup, gold_stats)
+    episode.difficulty = difficulty
+    return episode
 
 
 def start_all_episodes(vec_bridge: VecOpenFrontBridge, gold_stats: RunningMeanStd) -> list[EpisodeState]:
@@ -547,6 +582,9 @@ def collect_rollout(
     agent,
     episodes: list[EpisodeState],
     gold_stats: RunningMeanStd,
+    depletion_coef: float = TROOP_DEPLETION_COEF,
+    reward_mode: str = "econ",
+    decision: bool = False,
 ) -> tuple[list[EpisodeState], Rollout]:
     rollout_start = time.perf_counter()
 
@@ -570,9 +608,13 @@ def collect_rollout(
     rewards = np.zeros((STEPS, num_envs))
     dones = np.zeros((STEPS, num_envs), dtype=np.bool)
     wins = np.zeros((STEPS, num_envs), dtype=np.bool)
+    dec_types = np.zeros((STEPS, num_envs), dtype=np.int8)
     episode_end_golds_win = []
     episode_end_golds_loss = []
     wins_by_nations: dict[int, list[int]] = {}
+    end_structs_win: list[dict] = []
+    end_structs_loss: list[dict] = []
+    end_records: list[tuple] = []
 
     for i in range(STEPS):
         spatial_batch = np.stack([e.spatial for e in episodes])
@@ -580,25 +622,59 @@ def collect_rollout(
         entity_batch = np.stack([e.entities for e in episodes])
         entity_mask_batch = np.stack([e.entity_mask for e in episodes])
 
-        with torch.no_grad():
-            action, log_prob, entropy, value = agent.get_action_and_value(
-                spatial=torch.from_numpy(spatial_batch).to(DEVICE),
-                scalar=torch.from_numpy(scalar_batch).to(DEVICE),
-                entities=torch.from_numpy(entity_batch).to(DEVICE),
-                entity_mask=torch.from_numpy(entity_mask_batch).to(DEVICE),
-                action=None
-            )
-        actions_np = action.cpu().numpy()
-        log_probs_np = log_prob.cpu().numpy()
-        values_np = value.squeeze(-1).cpu().numpy()
+        if decision:
+            with torch.no_grad():
+                tau_a, tau_lp, tgt_a, tgt_lp, value, can_act = agent.act_decision(
+                    torch.from_numpy(spatial_batch).to(DEVICE), torch.from_numpy(scalar_batch).to(DEVICE),
+                    torch.from_numpy(entity_batch).to(DEVICE), torch.from_numpy(entity_mask_batch).to(DEVICE),
+                )
+            tau_a, tau_lp, tgt_a, tgt_lp, can_act = (x.cpu().numpy() for x in (tau_a, tau_lp, tgt_a, tgt_lp, can_act))
+            values_np = value.squeeze(-1).cpu().numpy()
+            actions_np = np.zeros(num_envs, dtype=np.int64)
+            log_probs_np = np.zeros(num_envs)
+            fire = [DO_NOTHING] * num_envs
+            for k in range(num_envs):
+                ep = episodes[k]
+                resample = ep.phase == 0
+                if ep.phase == 1:
+                    if ep.scalar[1] >= ep.tau and can_act[k]:
+                        idx = int(tgt_a[k])
+                        fire[k] = ep.targets[idx] if idx < len(ep.targets) else DO_NOTHING
+                        ep.phase = 0
+                        dec_types[i, k], actions_np[k], log_probs_np[k] = 2, idx, tgt_lp[k]
+                    else:
+                        ep.wait += 1
+                        resample = DEC_INTERRUPT and (ep.wait >= DEC_WAIT_CAP or ep.scalar[4] - ep.inc_ref >= DEC_INCOMING_JUMP)
+                if resample:
+                    ep.tau, ep.phase, ep.wait, ep.inc_ref = TAUS[int(tau_a[k])], 1, 0, float(ep.scalar[4])
+                    dec_types[i, k], actions_np[k], log_probs_np[k] = 1, tau_a[k], tau_lp[k]
+            intents_list = [action_to_intents(target=fire[k], agent_client_id=episodes[k].agent_client_id) for k in range(num_envs)]
+        else:
+            with torch.no_grad():
+                action, log_prob, entropy, value = agent.get_action_and_value(
+                    spatial=torch.from_numpy(spatial_batch).to(DEVICE),
+                    scalar=torch.from_numpy(scalar_batch).to(DEVICE),
+                    entities=torch.from_numpy(entity_batch).to(DEVICE),
+                    entity_mask=torch.from_numpy(entity_mask_batch).to(DEVICE),
+                    action=None
+                )
+            actions_np = action.cpu().numpy()
+            log_probs_np = log_prob.cpu().numpy()
+            values_np = value.squeeze(-1).cpu().numpy()
 
-        intents_list = [
-            action_to_intents(
-                target=episodes[k].targets[actions_np[k]] if actions_np[k] < len(episodes[k].targets) else DO_NOTHING,
-                agent_client_id=episodes[k].agent_client_id,
-            )
-            for k in range(num_envs)
-        ]
+            if agent.use_size:
+                tgt_idx = np.floor(actions_np).astype(np.int64)
+                size_frac = actions_np - tgt_idx
+            else:
+                tgt_idx, size_frac = actions_np, None
+            intents_list = [
+                action_to_intents(
+                    target=episodes[k].targets[tgt_idx[k]] if tgt_idx[k] < len(episodes[k].targets) else DO_NOTHING,
+                    agent_client_id=episodes[k].agent_client_id,
+                    troops=None if size_frac is None else size_frac[k] * episodes[k].player_stats.get(episodes[k].agent_small_id, {}).get("troops", 0.0),
+                )
+                for k in range(num_envs)
+            ]
         step_results = vec_bridge.step(intents_list)
 
         for k in range(num_envs):
@@ -617,13 +693,25 @@ def collect_rollout(
 
             entity_features, prev_stats, curr_stats, done, won = apply_step(episode, step_result)
             episode.ticks += 1
+            episode.peak = max(episode.peak, float(episode.scalar[2]))
+            capped = False
             if not done and episode.ticks >= MAX_EPISODE_TICKS:
                 print(f"[episode-cap] env {k} hit MAX_EPISODE_TICKS={MAX_EPISODE_TICKS} - forcing reset")
-                done, won = True, False
+                done, won, capped = True, False, True
             dones[i, k] = done
             wins[i, k] = won
 
-            reward = compute_reward(prev_stats, curr_stats, done, won, step_result["totalLand"], GAMMA)
+            if reward_mode == "blend":
+                own_troops = max(curr_stats.get("troops", 0.0), 1.0)
+                contact = min(1.0, (step_result["outgoingTroops"] + step_result["incomingTroops"]) / own_troops)
+                opp = strongest_adjacent_troops(step_result["attackMask"], episode.player_stats)
+                reward, episode.phi = compute_reward_blend(
+                    episode.phi, prev_stats, curr_stats, done, won, step_result["totalLand"], GAMMA, contact, opp, depletion_coef,
+                )
+            elif reward_mode == "logratio":
+                reward = compute_reward_logratio(prev_stats, curr_stats, done, won, step_result["totalLand"], GAMMA)
+            else:
+                reward = compute_reward(prev_stats, curr_stats, done, won, step_result["totalLand"], GAMMA, depletion_coef)
             rewards[i, k] = reward
 
             _apply_gold_stats(episode.scalar, entity_features, gold_stats)
@@ -640,8 +728,19 @@ def collect_rollout(
                 # does, not just "player is dead."
                 end_gold = curr_stats.get("gold", 0.0) if won else prev_stats.get("gold", curr_stats.get("gold", 0.0))
                 (episode_end_golds_win if won else episode_end_golds_loss).append(end_gold)
+                kind = "win" if won else "cap" if capped else "other" if step_result.get("winner") else "elim"
+                end_records.append((kind, episode.ticks, episode.peak))
+                structs = step_result.get("structures")
+                if structs:
+                    nation_ids = [sid for sid, t in episode.player_types.items() if t == "NATION"]
+                    agg: dict = {}
+                    for sid in nation_ids:
+                        for name, c in structs.get(str(sid), {}).items():
+                            agg[name] = agg.get(name, 0) + c
+                    n_nat = max(len(nation_ids), 1)
+                    (end_structs_win if won else end_structs_loss).append({k: v / n_nat for k, v in agg.items()})
                 num_nations = sum(1 for t in episode.player_types.values() if t == "NATION")
-                bucket = wins_by_nations.setdefault(num_nations, [0, 0])
+                bucket = wins_by_nations.setdefault(f"{num_nations}{episode.difficulty[:1]}", [0, 0])
                 bucket[1] += 1
                 if won:
                     bucket[0] += 1
@@ -683,9 +782,50 @@ def collect_rollout(
         episode_end_golds_win = episode_end_golds_win,
         episode_end_golds_loss = episode_end_golds_loss,
         wins_by_nations = wins_by_nations,
-        elapsed = time.perf_counter()-rollout_start)
+        end_structs_win = end_structs_win,
+        end_structs_loss = end_structs_loss,
+        end_records = end_records,
+        elapsed = time.perf_counter()-rollout_start,
+        dec_type=dec_types if decision else None)
 
     return episodes, rollout
+
+def _decision_gae(dec_type, rewards, dones, values, lam):
+    """GAE over decision ticks only (SMDP): reward between decisions is summed with per-tick
+    discounting and the bootstrap is discounted by the elapsed ticks. The incomplete tail
+    segment of each env is dropped."""
+    S, N = rewards.shape
+    r, d, v = rewards.numpy(), dones.numpy(), values.numpy()
+    adv = np.zeros((S, N), dtype=np.float32)
+    ret = np.zeros((S, N), dtype=np.float32)
+    mask = np.zeros((S, N), dtype=bool)
+    for k in range(N):
+        ticks = np.nonzero(dec_type[:, k] > 0)[0]
+        segs = []
+        for j, t0 in enumerate(ticks):
+            limit = int(ticks[j + 1]) if j + 1 < len(ticks) else S
+            R, disc, t, term = 0.0, 1.0, int(t0), False
+            while t < limit:
+                R += disc * r[t, k]
+                disc *= GAMMA
+                t += 1
+                if d[t - 1, k]:
+                    term = True
+                    break
+            if j + 1 == len(ticks) and not term:
+                continue
+            segs.append((int(t0), R, disc, term, int(ticks[j + 1]) if j + 1 < len(ticks) else -1))
+        a_next = 0.0
+        for t0, R, G, term, nxt in reversed(segs):
+            nonterm = 0.0 if term else 1.0
+            nv = v[nxt, k] if nonterm else 0.0
+            delta = R + G * nv * nonterm - v[t0, k]
+            a_next = delta + G * lam * nonterm * a_next
+            adv[t0, k] = a_next
+            ret[t0, k] = a_next + v[t0, k]
+            mask[t0, k] = True
+    return torch.from_numpy(adv), torch.from_numpy(ret), mask
+
 
 def ppo_update(
     rollout: Rollout,
@@ -750,20 +890,44 @@ def ppo_update(
             flat_target_values[idx] = chunk_value.squeeze(-1).cpu()
     target_values = flat_target_values.reshape(STEPS, rollout.num_envs)
 
+    gae_lambda = MEMBER_GAE_LAMBDA[member_id] if member_id < len(MEMBER_GAE_LAMBDA) else GAE_LAMBDA
+    decision = rollout.dec_type is not None
     running_advantage = torch.zeros(rollout.num_envs)
     next_value = target_last_value
     advantages = torch.zeros(STEPS, rollout.num_envs)
     returns = torch.zeros(STEPS, rollout.num_envs)
 
-    for t in reversed(range(STEPS)):
-        non_term = 1 - dones[t].float()
+    if decision:
+        advantages, returns, train_mask = _decision_gae(rollout.dec_type, rewards, dones, target_values, gae_lambda)
+    else:
+        for t in reversed(range(STEPS)):
+            non_term = 1 - dones[t].float()
 
-        delta = rewards[t] + (GAMMA * next_value * non_term) - target_values[t]
-        running_advantage = delta + (GAMMA * GAE_LAMBDA * non_term * running_advantage)
-        next_value = target_values[t]
+            delta = rewards[t] + (GAMMA * next_value * non_term) - target_values[t]
+            running_advantage = delta + (GAMMA * gae_lambda * non_term * running_advantage)
+            next_value = target_values[t]
 
-        advantages[t] = running_advantage
-        returns[t] = advantages[t] + target_values[t]
+            advantages[t] = running_advantage
+            returns[t] = advantages[t] + target_values[t]
+
+    value_lambda = MEMBER_VALUE_LAMBDA[member_id] if member_id < len(MEMBER_VALUE_LAMBDA) else None
+    total_all = STEPS * rollout.num_envs
+    if decision:
+        sel = torch.from_numpy(np.nonzero(train_mask.reshape(-1))[0])
+        advantages, returns = advantages.reshape(-1)[sel], returns.reshape(-1)[sel]
+        dec_types = torch.from_numpy(rollout.dec_type).reshape(-1)[sel]
+    else:
+        sel = slice(None)
+    frac_low_ratio = (scalar_buf.reshape(total_all, -1)[:, 1] < 0.15).float().mean().item()
+    if value_lambda is not None and not decision:
+        running_v = torch.zeros(rollout.num_envs)
+        next_value = target_last_value
+        for t in reversed(range(STEPS)):
+            non_term = 1 - dones[t].float()
+            delta = rewards[t] + (GAMMA * next_value * non_term) - target_values[t]
+            running_v = delta + (GAMMA * value_lambda * non_term * running_v)
+            next_value = target_values[t]
+            returns[t] = running_v + target_values[t]
 
     # raw (pre-normalization) scale, logged below - lets a burst-vs-calm update be
     # compared directly instead of only inferring it from win rate after the fact.
@@ -784,18 +948,18 @@ def ppo_update(
     return_std = (return_stats.var + 1e-8) ** 0.5
 
     # flatten (STEPS, num_envs, ...) -> (STEPS*num_envs, ...) for minibatching
-    total = STEPS * rollout.num_envs
-    bool_planes_buf = bool_planes_buf.reshape(total, *bool_planes_buf.shape[2:])
-    owner_grid_buf = owner_grid_buf.reshape(total, *owner_grid_buf.shape[2:])
-    ratio_table_buf = ratio_table_buf.reshape(total, *ratio_table_buf.shape[2:])
-    scalar_buf = scalar_buf.reshape(total, *scalar_buf.shape[2:])
-    entities_buf = entities_buf.reshape(total, *entities_buf.shape[2:])
-    entity_masks = entity_masks.reshape(total, *entity_masks.shape[2:])
-    actions = actions.reshape(total)
-    log_probs = log_probs.reshape(total)
+    total = len(sel) if decision else total_all
+    bool_planes_buf = bool_planes_buf.reshape(total_all, *bool_planes_buf.shape[2:])[sel]
+    owner_grid_buf = owner_grid_buf.reshape(total_all, *owner_grid_buf.shape[2:])[sel]
+    ratio_table_buf = ratio_table_buf.reshape(total_all, *ratio_table_buf.shape[2:])[sel]
+    scalar_buf = scalar_buf.reshape(total_all, *scalar_buf.shape[2:])[sel]
+    entities_buf = entities_buf.reshape(total_all, *entities_buf.shape[2:])[sel]
+    entity_masks = entity_masks.reshape(total_all, *entity_masks.shape[2:])[sel]
+    actions = actions.reshape(total_all)[sel]
+    log_probs = log_probs.reshape(total_all)[sel]
     advantages = advantages.reshape(total)
     returns = returns.reshape(total)
-    values = values.reshape(total)
+    values = values.reshape(total_all)[sel]
 
     # 2026-08-27: direct test of the "state-distribution narrowing" collapse hypothesis
     # (see CLAUDE.md) - LOW_RATIO_THRESHOLD picks out the rare/dangerous tail of states
@@ -806,11 +970,10 @@ def ppo_update(
     # is dominated by the common, well-covered states) looks fine - the actual
     # falsifiable prediction of the hypothesis, not just an analogy to it.
     LOW_RATIO_THRESHOLD = 0.15
-    frac_low_ratio = (scalar_buf[:, 1] < LOW_RATIO_THRESHOLD).float().mean().item()
 
     # anchor buffer fill - see anchor_buffer.py and the ANCHOR_* constants above.
     anchor_buffer.evict_older_than(update, ANCHOR_MAX_AGE_UPDATES)
-    anchor_inserted = anchor_buffer.insert_from_rollout(
+    anchor_inserted = 0 if decision else anchor_buffer.insert_from_rollout(
         bool_planes_buf.numpy(), owner_grid_buf.numpy(), ratio_table_buf.numpy(),
         scalar_buf.numpy(), entities_buf.numpy(), entity_masks.numpy(),
         actions.numpy(), raw_advantages_np, returns.numpy(),
@@ -821,19 +984,25 @@ def ppo_update(
     # see LOW_RATIO_* constants above - keeps the value head calibrated on this tail
     # regardless of how rare it's become in the live rollout.
     low_ratio_buffer.evict_older_than(update, LOW_RATIO_MAX_AGE_UPDATES)
-    low_ratio_inserted = low_ratio_buffer.insert_low_ratio_from_rollout(
+    low_ratio_inserted = 0 if decision else low_ratio_buffer.insert_low_ratio_from_rollout(
         bool_planes_buf.numpy(), owner_grid_buf.numpy(), ratio_table_buf.numpy(),
         scalar_buf.numpy(), entities_buf.numpy(), entity_masks.numpy(),
         actions.numpy(), returns.numpy(),
         LOW_RATIO_THRESHOLD, update, LOW_RATIO_MAX_INSERT_PER_UPDATE,
     )
 
+    mean_tau = 0.0
+    if decision:
+        tau_mask = dec_types == 1
+        if tau_mask.any():
+            mean_tau = float(np.mean([TAUS[int(a)] for a in actions[tau_mask]]))
     rollout_elapsed = rollout.elapsed
     ppo_start = time.perf_counter()
 
     policy_loss_sum = 0.0
     value_loss_sum = 0.0
     entropy_sum = 0.0
+    gate_kl_sum = 0.0
     num_minibatches = 0
     approx_kl = 0.0
     epochs_run = 0
@@ -860,11 +1029,15 @@ def ppo_update(
     # anchor batch for logging, but anchor_loss*0.0 backward is a no-op) - simpler than
     # restructuring the epoch loop to skip the step outright, identical end behavior.
     anchor_coef = 0.0 if OFM_ABLATION == "no_anchor" else ANCHOR_COEF
-    for epoch in range(PPO_EPOCHS):
+    if member_id < len(MEMBER_ANCHOR_COEF):
+        anchor_coef = MEMBER_ANCHOR_COEF[member_id]
+    n_epochs = DEC_EPOCHS if decision else PPO_EPOCHS
+    mb_size = DEC_MINIBATCH if decision else MINIBATCH_SIZE
+    for epoch in range(n_epochs):
         epochs_run = epoch + 1
         indices = torch.randperm(total)
-        for start in range(0, total, MINIBATCH_SIZE):
-            batch_idx = indices[start:start+MINIBATCH_SIZE]
+        for start in range(0, total, mb_size):
+            batch_idx = indices[start:start+mb_size]
 
             batch_scalar = scalar_buf[batch_idx].to(DEVICE)
             batch_spatial = reconstruct_spatial_torch(
@@ -872,13 +1045,19 @@ def ppo_update(
                 ratio_table_buf[batch_idx].to(DEVICE).float(), batch_scalar[:, 1], static_planes,
             )
 
-            new_action, new_log_prob, entropy, new_value = agent.get_action_and_value(
-                spatial=batch_spatial,
-                scalar=batch_scalar,
-                entities=entities_buf[batch_idx].to(DEVICE),
-                entity_mask=entity_masks[batch_idx].to(DEVICE),
-                action=actions[batch_idx].to(DEVICE)
-            )
+            if decision:
+                new_log_prob, entropy, new_value = agent.evaluate_decision(
+                    batch_spatial, batch_scalar, entities_buf[batch_idx].to(DEVICE), entity_masks[batch_idx].to(DEVICE),
+                    dec_types[batch_idx].to(DEVICE), actions[batch_idx].long().to(DEVICE),
+                )
+            else:
+                new_action, new_log_prob, entropy, new_value = agent.get_action_and_value(
+                    spatial=batch_spatial,
+                    scalar=batch_scalar,
+                    entities=entities_buf[batch_idx].to(DEVICE),
+                    entity_mask=entity_masks[batch_idx].to(DEVICE),
+                    action=actions[batch_idx].to(DEVICE)
+                )
 
             batch_log_probs = log_probs[batch_idx].to(DEVICE)
             batch_advantages = advantages[batch_idx].to(DEVICE)
@@ -899,12 +1078,15 @@ def ppo_update(
 
             # same clip-and-take-worse-case idea as the policy ratio, applied to value
             new_value = new_value.squeeze(-1)
-            value_clipped = batch_old_values + torch.clamp(
-                new_value - batch_old_values, -CLIP_EPS, CLIP_EPS
-            )
+            clip_mode = MEMBER_VALUE_CLIP[member_id] if member_id < len(MEMBER_VALUE_CLIP) else VALUE_CLIP_MODE
             value_loss_unclipped = torch.square((new_value - batch_returns) / return_std)
-            value_loss_clipped = torch.square((value_clipped - batch_returns) / return_std)
-            value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+            if clip_mode == "none":
+                value_loss = 0.5 * value_loss_unclipped.mean()
+            else:
+                eps = CLIP_EPS * (return_std if clip_mode == "scaled" else 1.0)
+                value_clipped = batch_old_values + torch.clamp(new_value - batch_old_values, -eps, eps)
+                value_loss_clipped = torch.square((value_clipped - batch_returns) / return_std)
+                value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
             if epoch == 0:
                 with torch.no_grad():
@@ -920,6 +1102,10 @@ def ppo_update(
             entropy_bonus = entropy.mean()
 
             loss = policy_loss + VALUE_COEF * value_loss - entropy_coef * entropy_bonus
+            if GATE_KL_COEF > 0 and agent.gate_kl is not None:
+                gate_kl_mean = agent.gate_kl.mean()
+                loss = loss + GATE_KL_COEF * gate_kl_mean
+                gate_kl_sum += gate_kl_mean.item()
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
@@ -933,7 +1119,7 @@ def ppo_update(
         # anchor buffer step - once per epoch (not per minibatch), see anchor_buffer.py
         # and the ANCHOR_* constants above. Self-imitation (Oh et al. 2018) form, not
         # PPO's importance-sampled objective - see module docstring for why.
-        anchor_batch = anchor_buffer.sample(ANCHOR_MINIBATCH_SIZE) if len(anchor_buffer) >= ANCHOR_MIN_FILL else None
+        anchor_batch = anchor_buffer.sample(ANCHOR_MINIBATCH_SIZE) if len(anchor_buffer) >= ANCHOR_MIN_FILL and not decision else None
         if anchor_batch is not None:
             a_scalar = torch.from_numpy(anchor_batch["scalar"]).to(DEVICE)
             a_spatial = reconstruct_spatial_torch(
@@ -972,7 +1158,7 @@ def ppo_update(
             anchor_loss_sum += anchor_loss.item()
             anchor_steps += 1
 
-        low_ratio_batch = low_ratio_buffer.sample(LOW_RATIO_MINIBATCH_SIZE) if len(low_ratio_buffer) >= LOW_RATIO_MIN_FILL else None
+        low_ratio_batch = low_ratio_buffer.sample(LOW_RATIO_MINIBATCH_SIZE) if len(low_ratio_buffer) >= LOW_RATIO_MIN_FILL and not decision else None
         if low_ratio_batch is not None:
             lr_scalar = torch.from_numpy(low_ratio_batch["scalar"]).to(DEVICE)
             lr_spatial = reconstruct_spatial_torch(
@@ -1015,6 +1201,20 @@ def ppo_update(
     total_train_hours += total_elapsed / 3600
 
     num_minibatches = max(num_minibatches, 1)
+    def _ends_str(recs):
+        out = []
+        for kind in ("win", "elim", "other", "cap"):
+            r = [x for x in recs if x[0] == kind]
+            if r:
+                t = sorted(x[1] for x in r)
+                out.append(f"{kind}:n={len(r)},t_med={t[len(t) // 2]},peak={sum(x[2] for x in r) / len(r):.2f}")
+        return ";".join(out) or "-"
+
+    def _structs_str(rows):
+        if not rows:
+            return "-"
+        return ",".join(f"{k}={sum(r.get(k, 0) for r in rows) / len(rows):.2f}" for k in rows[0])
+
     wins_by_nations_str = " ".join(
         f"n{n}={w}/{t}" for n, (w, t) in sorted(rollout.wins_by_nations.items())
     )
@@ -1022,12 +1222,15 @@ def ppo_update(
         f"member{member_id} update {update}: mean_reward={rewards.mean().item():.3f} "
         f"episodes_finished={rollout.episodes_finished} wins={rollout.episode_wins} "
         f"[{wins_by_nations_str}] "
+        f"ends({_ends_str(rollout.end_records)}) "
+        f"nation_structs_win({_structs_str(rollout.end_structs_win)}) nation_structs_loss({_structs_str(rollout.end_structs_loss)}) "
         f"mean_gold_at_win={mean_gold_at_win:,.0f} mean_gold_at_loss={mean_gold_at_loss:,.0f} "
         f"policy_loss={policy_loss_sum / num_minibatches:.4f} "
         f"value_loss={value_loss_sum / num_minibatches:.4f} "
-        f"entropy={entropy_sum / num_minibatches:.4f} "
+        f"entropy={entropy_sum / num_minibatches:.4f} gate_kl={gate_kl_sum / num_minibatches:.4f} "
         f"approx_kl={approx_kl:.4f} epochs_run={epochs_run} "
         f"frac_low_ratio={frac_low_ratio:.4f} "
+        f"decisions={total if decision else 0} mean_tau={mean_tau:.3f} "
         f"value_err_low_ratio={low_ratio_err_sum / max(low_ratio_err_count, 1):.4f}(n={low_ratio_err_count}) "
         f"value_err_normal={normal_err_sum / max(normal_err_count, 1):.4f}(n={normal_err_count}) "
         f"anchor_buffer_size={len(anchor_buffer)} anchor_inserted={anchor_inserted} "
@@ -1059,6 +1262,9 @@ class Member:
     win_rate_ema: float = 0.0
     entropy_scale: float = 1.0
     lr_scale: float = 1.0
+    depletion_coef: float = TROOP_DEPLETION_COEF
+    reward_mode: str = "econ"
+    decision: bool = False
     # rate-limited toward entropy_coef_for(win_rate_ema)*entropy_scale each update - see
     # ENTROPY_COEF_MAX_STEP above. Not derived fresh each update like the old scheme.
     entropy_coef_current: float = ENTROPY_COEF_MIN
@@ -1102,6 +1308,12 @@ def _load_member(member_id: int, vec_bridge: VecOpenFrontBridge) -> Member:
         entropy_coef_current = entropy_coef_for(win_rate_ema) * entropy_scale
 
     episodes = start_all_episodes(vec_bridge, gold_stats)
+    separate = MEMBER_SEPARATE_CRITIC[member_id] if member_id < len(MEMBER_SEPARATE_CRITIC) else os.environ.get("OFM_SEPARATE_CRITIC", "0") == "1"
+    os.environ["OFM_SEPARATE_CRITIC"] = "1" if separate else "0"
+    decision_member = MEMBER_DECISION[member_id] if member_id < len(MEMBER_DECISION) else os.environ.get("OFM_DECISION_DEFAULT", "1") == "1"
+    os.environ["OFM_DECISION"] = "1" if decision_member else "0"
+    if member_id < len(MEMBER_DETACH_GATE_ENTROPY):
+        os.environ["OFM_DETACH_GATE_ENTROPY"] = "1" if MEMBER_DETACH_GATE_ENTROPY[member_id] else "0"
     agent = Agent.from_observation(episodes[0].spatial, episodes[0].scalar, episodes[0].entities).to(DEVICE)
     reinitialized = []
     if checkpoint is not None:
@@ -1111,14 +1323,29 @@ def _load_member(member_id: int, vec_bridge: VecOpenFrontBridge) -> Member:
         # the whole resume.
         own_state = agent.state_dict()
         saved_state = checkpoint["model"]
+        padded = []
+        for k, v in list(saved_state.items()):
+            t = own_state.get(k)
+            if t is not None and v.ndim == 2 and t.ndim == 2 and v.shape[0] == t.shape[0] and v.shape[1] < t.shape[1]:
+                saved_state[k] = torch.cat([v, v.new_zeros(v.shape[0], t.shape[1] - v.shape[1])], dim=1)
+                padded.append(k)
         reinitialized = [
             k for k, v in saved_state.items() if k in own_state and v.shape != own_state[k].shape
         ]
         for k in reinitialized:
             del saved_state[k]
         missing, unexpected = agent.load_state_dict(saved_state, strict=False)
+        gate_p = float(os.environ.get("OFM_GATE_INIT_P", "0"))
+        if gate_p > 0 and "size_head.weight" not in saved_state:
+            with torch.no_grad():
+                agent.gate_head.weight.zero_()
+                agent.gate_head.bias.copy_(torch.tensor([0.0, float(np.log(gate_p / (1 - gate_p)))]))
+            print(f"member{member_id} gate_head reset to p(act)={gate_p}")
         if reinitialized:
             print(f"member{member_id} resumed from {checkpoint_path}: reinitialized (shape changed) {reinitialized}")
+        if agent.separate_critic and any(k.startswith("value_backbone") for k in missing):
+            agent.value_backbone.load_state_dict(agent.backbone.state_dict())
+            print(f"member{member_id} separate critic initialised from policy backbone")
         if missing or unexpected:
             print(f"member{member_id} partial resume from {checkpoint_path}: missing={missing} unexpected={unexpected}")
         else:
@@ -1139,7 +1366,7 @@ def _load_member(member_id: int, vec_bridge: VecOpenFrontBridge) -> Member:
     optimizer_reset_at = None
     if checkpoint is not None:
         optimizer_state = checkpoint.get("optimizer")
-        if optimizer_state is not None and not reinitialized:
+        if optimizer_state is not None and not reinitialized and not padded and not missing and not unexpected:
             try:
                 optimizer.load_state_dict(optimizer_state)
                 print(f"member{member_id} restored optimizer state from {checkpoint_path}")
@@ -1147,7 +1374,7 @@ def _load_member(member_id: int, vec_bridge: VecOpenFrontBridge) -> Member:
                 print(f"member{member_id} could not restore optimizer state ({e}) - falling back to LR warmup")
                 optimizer_reset_at = 0
         else:
-            reason = "reinitialized params" if reinitialized else "no saved optimizer state (older checkpoint)"
+            reason = "reinitialized/padded/changed params" if reinitialized or padded or missing or unexpected else "no saved optimizer state (older checkpoint)"
             print(f"member{member_id} optimizer state not restored ({reason}) - falling back to LR warmup")
             optimizer_reset_at = 0
 
@@ -1166,6 +1393,9 @@ def _load_member(member_id: int, vec_bridge: VecOpenFrontBridge) -> Member:
         entropy_coef_current=entropy_coef_current,
         checkpoint_total_train_hours=checkpoint_total_train_hours,
         optimizer_reset_at=optimizer_reset_at,
+        depletion_coef=MEMBER_DEPLETION_COEF[member_id] if member_id < len(MEMBER_DEPLETION_COEF) else TROOP_DEPLETION_COEF,
+        reward_mode=MEMBER_REWARD_MODE[member_id] if member_id < len(MEMBER_REWARD_MODE) else "econ",
+        decision=decision_member,
     )
 
 
@@ -1247,7 +1477,7 @@ def train():
                 # rather than a real plateau. target_agent still drives GAE's value
                 # bootstrap below (its original, lower-risk use) - only the
                 # environment-facing policy reverts to the live, fast-moving one.
-                m.episodes, rollout = collect_rollout(m.vec_bridge, m.agent, m.episodes, m.gold_stats)
+                m.episodes, rollout = collect_rollout(m.vec_bridge, m.agent, m.episodes, m.gold_stats, m.depletion_coef, m.reward_mode, m.decision)
                 target_last_value = compute_value_for_episodes(m.target_agent, m.episodes)
 
                 current_win_rate = rollout.episode_wins / rollout.episodes_finished if rollout.episodes_finished else m.win_rate_ema
@@ -1267,7 +1497,9 @@ def train():
                 if OFM_ABLATION == "fixed_entropy":
                     # adaptation fully disabled - isolates whether win-rate-driven
                     # entropy_coef (even rate-limited) is a contributor at all.
-                    m.entropy_coef_current = FIXED_ENTROPY_COEF
+                    m.entropy_coef_current = (
+                        MEMBER_ENTROPY_COEFS[m.id] if m.id < len(MEMBER_ENTROPY_COEFS) else FIXED_ENTROPY_COEF
+                    )
                 else:
                     # rate-limited toward the target instead of snapping to it - see
                     # ENTROPY_COEF_MAX_STEP above (anti-windup fix for the entropy/win-rate
@@ -1289,7 +1521,7 @@ def train():
                 # frees this member's buffers before the next member's collect_rollout allocates its own
                 del rollout
 
-            if update != 0 and update % PBT_INTERVAL == 0:
+            if not PBT_DISABLED and update != 0 and update % PBT_INTERVAL == 0:
                 _pbt_step(members, update)
 
             if update != 0 and update % CHECKPOINT_INTERVAL == 0:

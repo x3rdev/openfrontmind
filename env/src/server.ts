@@ -8,7 +8,7 @@
 console.log = console.error;
 
 import readline from "node:readline";
-import { Difficulty, isDifficulty, Player, Team } from "../../engine/OpenFrontIO/src/core/game/Game";
+import { Difficulty, isDifficulty, Player, Team, UnitType } from "../../engine/OpenFrontIO/src/core/game/Game";
 import { StampedIntent } from "../../engine/OpenFrontIO/src/core/Schemas";
 import { HarnessSession, reset, step } from "./harness";
 
@@ -53,6 +53,25 @@ function maxTroopsBySmallID(session: HarnessSession): Record<number, number> {
   const config = session.game.config();
   return Object.fromEntries(
     session.game.players().map((p) => [p.smallID(), config.maxTroops(p)]),
+  );
+}
+
+const STRUCTURE_TYPES: Record<string, UnitType> = {
+  city: UnitType.City,
+  defensePost: UnitType.DefensePost,
+  port: UnitType.Port,
+  silo: UnitType.MissileSilo,
+  sam: UnitType.SAMLauncher,
+  factory: UnitType.Factory,
+  warship: UnitType.Warship,
+};
+
+function structuresBySmallID(session: HarnessSession): Record<number, Record<string, number>> {
+  return Object.fromEntries(
+    session.game.players().map((p) => [
+      p.smallID(),
+      Object.fromEntries(Object.entries(STRUCTURE_TYPES).map(([k, t]) => [k, p.unitCount(t)])),
+    ]),
   );
 }
 
@@ -174,6 +193,7 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       unitUpdates: result.unitUpdates,
       maxTroops: maxTroopsBySmallID(session),
       totalLand: totalLand(session),
+      structures: result.done ? structuresBySmallID(session) : null,
     });
     return;
   }
