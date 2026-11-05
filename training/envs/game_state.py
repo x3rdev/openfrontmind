@@ -41,6 +41,7 @@ class EpisodeState:
     ticks: int = 0
     peak: float = 0.0
     difficulty: str = ""
+    seed: str = ""
 
 
 def apply_tile_updates(

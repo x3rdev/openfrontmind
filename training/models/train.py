@@ -29,6 +29,9 @@ NATIONS = int(os.environ.get("OFM_NATIONS", "5"))
 # One difficulty is drawn per episode; repeat a name to weight it, e.g. "Medium,Medium,Hard".
 DIFFICULTIES = os.environ.get("OFM_DIFFICULTY", "Easy").split(",")
 DIFFICULTY = DIFFICULTIES[0]
+FIXED_SEED = os.environ.get("OFM_FIXED_SEED")  # set to replay one map/spawn/Nation every episode
+REPLAY_PROB = float(os.environ.get("OFM_REPLAY_PROB", "0.1"))
+WON_SEEDS: set[str] = set()  # seeds of won games, replayed until lost
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -192,8 +195,12 @@ def _episode_state_from_setup(setup: dict, gold_stats: RunningMeanStd) -> Episod
 
 def start_episode(bridge, gold_stats: RunningMeanStd) -> EpisodeState:
     difficulty = random.choice(DIFFICULTIES)
+    if WON_SEEDS and random.random() < REPLAY_PROB:
+        seed = random.choice(list(WON_SEEDS))
+    else:
+        seed = FIXED_SEED or str(random.randint(0, 2 ** 31 - 1))
     setup = bridge.reset(
-        seed=str(random.randint(0, 2 ** 31 - 1)),
+        seed=seed,
         map="mid_plains",
         bots=BOTS,
         nations=NATIONS,
@@ -201,6 +208,7 @@ def start_episode(bridge, gold_stats: RunningMeanStd) -> EpisodeState:
     )
     episode = _episode_state_from_setup(setup, gold_stats)
     episode.difficulty = difficulty
+    episode.seed = seed
     return episode
 
 
@@ -328,6 +336,9 @@ def collect_rollout(
                 bucket[1] += 1
                 if won:
                     bucket[0] += 1
+                    WON_SEEDS.add(episode.seed)
+                else:
+                    WON_SEEDS.discard(episode.seed)
                 episodes[k] = start_episode(vec_bridge.bridges[k], gold_stats)
 
     # an env that never finished is bootstrapped from last_value instead of a terminal reward
@@ -469,14 +480,16 @@ def ppo_update(
     returns = returns.reshape(total)
     values = values.reshape(total)
 
-    anchor_buffer.evict_older_than(update, ANCHOR_MAX_AGE_UPDATES)
-    anchor_inserted = anchor_buffer.insert_from_rollout(
-        bool_planes_buf.numpy(), owner_grid_buf.numpy(), ratio_table_buf.numpy(),
-        scalar_buf.numpy(), entities_buf.numpy(), entity_masks.numpy(),
-        actions.numpy(), raw_advantages_np, returns.numpy(),
-        HIGH_RATIO_THRESHOLD, update, ANCHOR_MAX_INSERT_PER_UPDATE,
-        high_ratio_ceiling=HIGH_RATIO_CEILING,
-    )
+    # anchor buffer disabled (replaced by seed replay); empty buffer skips the anchor step
+    # anchor_buffer.evict_older_than(update, ANCHOR_MAX_AGE_UPDATES)
+    # anchor_inserted = anchor_buffer.insert_from_rollout(
+    #     bool_planes_buf.numpy(), owner_grid_buf.numpy(), ratio_table_buf.numpy(),
+    #     scalar_buf.numpy(), entities_buf.numpy(), entity_masks.numpy(),
+    #     actions.numpy(), raw_advantages_np, returns.numpy(),
+    #     HIGH_RATIO_THRESHOLD, update, ANCHOR_MAX_INSERT_PER_UPDATE,
+    #     high_ratio_ceiling=HIGH_RATIO_CEILING,
+    # )
+    anchor_inserted = 0
 
     low_ratio_buffer.evict_older_than(update, LOW_RATIO_MAX_AGE_UPDATES)
     low_ratio_inserted = low_ratio_buffer.insert_low_ratio_from_rollout(
