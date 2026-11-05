@@ -14,7 +14,7 @@ from training.envs.observation import encode_observation, reconstruct_spatial_to
 from training.envs.action_space import build_entities, pad_entities, action_to_intents, DO_NOTHING
 from training.envs.reward import compute_reward
 from training.envs.running_stats import RunningMeanStd
-from training.models.policy import Agent
+from training.models.policy import Agent, load_padded
 from training.models.anchor_buffer import AnchorBuffer
 
 # Rollout length. Sized so most games finish inside one rollout; NUM_ENVS is bounded
@@ -687,7 +687,7 @@ def train():
         optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
         warmup_from_update = None  # set when the optimizer starts without saved state
         if checkpoint is not None:
-            agent.load_state_dict(checkpoint["model"])
+            load_padded(agent, checkpoint["model"])
             try:
                 optimizer.load_state_dict(checkpoint["optimizer"])
             except (KeyError, TypeError, ValueError, RuntimeError):

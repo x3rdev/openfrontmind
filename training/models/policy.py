@@ -176,3 +176,16 @@ class Agent(nn.Module):
         emb = entity_embeds[torch.arange(entity_embeds.shape[0], device=entity_embeds.device), target_idx]
         raw = self.size_head(torch.cat([hidden, scalar, emb], dim=-1))
         return Beta(1.0 + F.softplus(raw[:, 0]), 1.0 + F.softplus(raw[:, 1]))
+
+
+def load_padded(agent: nn.Module, state: dict) -> None:
+    """load_state_dict that zero-pads input columns of 2-D weights, so a checkpoint from
+    before new entity features were added loads with those features starting inert."""
+    own = agent.state_dict()
+    fixed = {}
+    for k, v in state.items():
+        t = own.get(k)
+        if t is not None and v.ndim == 2 and t.shape[0] == v.shape[0] and t.shape[1] > v.shape[1]:
+            v = torch.cat([v, torch.zeros(v.shape[0], t.shape[1] - v.shape[1], dtype=v.dtype, device=v.device)], dim=1)
+        fixed[k] = v
+    agent.load_state_dict(fixed)

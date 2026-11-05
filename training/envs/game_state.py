@@ -166,6 +166,7 @@ def apply_step(episode: EpisodeState, step_result: dict) -> tuple[np.ndarray, di
     entity_features, episode.targets = build_entities(
         step_result["attackMask"], episode.player_stats, episode.player_types, total_land,
         agent_ratio=curr_stats.get("troops", 0.0) / max(curr_stats.get("maxTroops", 1.0), 1),
+        agent_troops=curr_stats.get("troops", 0.0), agent_tiles=curr_stats.get("tilesOwned", 0.0),
     )
 
     return entity_features, prev_stats, curr_stats, done, won

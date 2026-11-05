@@ -11,7 +11,7 @@ from training.envs.map_view import draw_troop_counts, draw_units, outline_agent_
 from training.envs.observation import encode_observation
 from training.envs.action_space import build_entities, pad_entities, action_to_intents, DO_NOTHING
 from training.envs.running_stats import RunningMeanStd
-from training.models.policy import Agent
+from training.models.policy import Agent, load_padded
 from training.models.train import latest_checkpoint, BOTS, NATIONS, DIFFICULTY
 
 
@@ -71,7 +71,7 @@ def main(
         )
 
         agent = Agent.from_observation(spatial, scalar, entities)
-        agent.load_state_dict(checkpoint["model"])
+        load_padded(agent, checkpoint["model"])
         agent.eval()
 
         if not headless:

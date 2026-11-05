@@ -8,8 +8,9 @@ features (policy.py), so row order carries no meaning. do-nothing is an all-zero
 import numpy as np
 
 # [is_tribe, is_nation, is_wilderness, is_do_nothing, tile_fraction, log_gold, troop_ratio,
-#  attacking_me_ratio, already_attacking, agent_ratio - troop_ratio]
-ENTITY_FEATURES = 10
+#  attacking_me_ratio, already_attacking, agent_ratio - troop_ratio,
+#  log(their troops / my troops), log(their troops per tile / mine)]
+ENTITY_FEATURES = 12
 MAX_ENTITIES = 16  # buffer size; excess candidates are dropped for that tick
 
 DO_NOTHING = object()  # sentinel target, distinct from a real id or wilderness (None)
@@ -17,12 +18,13 @@ DO_NOTHING = object()  # sentinel target, distinct from a real id or wilderness 
 
 def build_entities(
     attack_mask: list, player_stats: dict, player_types: dict, total_land: float,
-    agent_ratio: float = 0.0,
+    agent_ratio: float = 0.0, agent_troops: float = 0.0, agent_tiles: float = 0.0,
 ) -> tuple[np.ndarray, list]:
     """Returns (features, targets): one row per candidate plus a final do-nothing row,
     and the matching target for action_to_intents."""
     rows = []
     targets = []
+    agent_density = agent_troops / max(agent_tiles, 1)
     for c in attack_mask:
         # re-attacking a target merges into the existing attack, so these rows stay legal
         already_attacking = float(c["alreadyAttacking"])
@@ -33,6 +35,8 @@ def build_entities(
             troop_ratio = stats.get("troops", 0.0) / max_troops
             # share of this player's army currently attacking the agent
             attacking_me_ratio = c["attackingMeTroops"] / max_troops
+            their_troops = stats.get("troops", 0.0)
+            their_density = their_troops / max(stats.get("tilesOwned", 0.0), 1)
             rows.append([
                 float(ptype == "BOT"),
                 float(ptype == "NATION"),
@@ -44,13 +48,15 @@ def build_entities(
                 attacking_me_ratio,
                 already_attacking,
                 agent_ratio - troop_ratio,
+                float(np.log((their_troops + 1) / (agent_troops + 1))),
+                float(np.log((their_density + 1) / (agent_density + 1))),
             ])
             targets.append(c["targetID"])
         else:
-            rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, already_attacking, 0.0])
+            rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, already_attacking, 0.0, 0.0, 0.0])
             targets.append(None)
 
-    rows.append([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    rows.append([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     targets.append(DO_NOTHING)
 
     return np.array(rows, dtype=np.float32), targets
