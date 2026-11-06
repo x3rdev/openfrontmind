@@ -116,8 +116,7 @@ class Agent(nn.Module):
         troop_ratio = scalar[:, 1]
 
         is_do_nothing = entities[..., 3] > 0.5
-        is_already_attacking = entities[..., 8] > 0.5
-        real_target_mask = entity_mask & ~is_do_nothing & ~is_already_attacking
+        real_target_mask = entity_mask & ~is_do_nothing
         can_act = real_target_mask.any(dim=-1) & (troop_ratio >= self.reserve_floor)
         do_nothing_idx = is_do_nothing.float().argmax(dim=-1)
 
