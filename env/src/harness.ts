@@ -15,7 +15,8 @@ import {
   PlayerID,
   PlayerInfo,
   PlayerType,
-  Team
+  Team,
+  UnitType
 } from "../../engine/OpenFrontIO/src/core/game/Game";
 import {genTerrainFromBin, MapManifest} from "../../engine/OpenFrontIO/src/core/game/TerrainMapLoader";
 import {GameUpdateType, UnitUpdate} from "../../engine/OpenFrontIO/src/core/game/GameUpdates";
@@ -34,6 +35,12 @@ const PROJECT_ROOT = path.resolve(
 );
 
 const MAX_SPAWN_TURNS = 1000;
+
+// Scripted city purchase for the agent, enabled with OFM_AUTO_CITY=1.
+const AUTO_CITY = process.env.OFM_AUTO_CITY === "1";
+const AUTO_CITY_MAX = 3;
+const AUTO_CITY_COOLDOWN_TICKS = 30;
+const AUTO_CITY_GRID_STRIDE = 8;
 
 // Loads a vendored test map by folder name (tests/testdata/maps/).
 async function loadTestMap(name: string) {
@@ -71,6 +78,7 @@ export interface HarnessSession {
   game: ReturnType<typeof createGame>;
   state: HarnessState;
   agentClientID: string;
+  lastCityTick: number;
 }
 
 export async function reset(
@@ -179,7 +187,7 @@ export async function reset(
   state.packedTileUpdates = combined;
   state.unitUpdates = spawnUnitUpdates;
 
-  return { runner, game, state, agentClientID };
+  return { runner, game, state, agentClientID, lastCityTick: -Infinity };
 }
 
 export interface AttackTarget {
@@ -250,11 +258,45 @@ function computeAttackMask(
   return { attackMask, outgoingTroops, incomingTroops };
 }
 
+// Builds a city at the buildable site nearest the centroid of the agent's territory.
+function autoCityIntent(session: HarnessSession): StampedIntent | null {
+  const { game } = session;
+  const agent = game.playerByClientID(session.agentClientID);
+  if (agent === null || !agent.isAlive()) return null;
+  if (game.ticks() - session.lastCityTick < AUTO_CITY_COOLDOWN_TICKS) return null;
+  if (agent.unitCount(UnitType.City) >= AUTO_CITY_MAX) return null;
+  if (Number(agent.gold()) < Number(game.config().unitInfo(UnitType.City).cost(game, agent))) return null;
+
+  const map = game.map();
+  const owned: [number, number][] = [];
+  for (let y = 0; y < map.height(); y += AUTO_CITY_GRID_STRIDE) {
+    for (let x = 0; x < map.width(); x += AUTO_CITY_GRID_STRIDE) {
+      if (map.ownerID(map.ref(x, y)) === agent.smallID()) owned.push([x, y]);
+    }
+  }
+  if (owned.length === 0) return null;
+  const cx = owned.reduce((a, [x]) => a + x, 0) / owned.length;
+  const cy = owned.reduce((a, [, y]) => a + y, 0) / owned.length;
+  owned.sort((a, b) => (a[0] - cx) ** 2 + (a[1] - cy) ** 2 - ((b[0] - cx) ** 2 + (b[1] - cy) ** 2));
+  for (const [x, y] of owned.slice(0, 20)) {
+    const site = agent.canBuild(UnitType.City, map.ref(x, y));
+    if (site !== false) {
+      session.lastCityTick = game.ticks();
+      return { type: "build_unit", unit: UnitType.City, tile: site, clientID: session.agentClientID } as unknown as StampedIntent;
+    }
+  }
+  return null;
+}
+
 export function step(
   session: HarnessSession,
   intents: StampedIntent[] = [],
 ): StepResult {
   const { runner, game, state } = session;
+  if (AUTO_CITY) {
+    const build = autoCityIntent(session);
+    if (build !== null) intents = [...intents, build];
+  }
   runner.addTurn({ turnNumber: state.turnNumber++, intents });
   const ok = runner.executeNextTick();
   if (!ok || state.fatalError !== undefined) {
