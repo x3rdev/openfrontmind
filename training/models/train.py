@@ -24,8 +24,10 @@ NUM_UPDATES = 10000
 NUM_ENVS = int(os.environ.get("OFM_NUM_ENVS", "10"))
 MAX_EPISODE_TICKS = 10000  # episodes still running at this tick count are ended as a loss
 
-BOTS = 0
 NATIONS = int(os.environ.get("OFM_NATIONS", "5"))
+# Tribes per Nation; real lobbies run 400 Tribes against 61 Nations on `world` (6.6:1) and 97 on `giantworldmap` (4.1:1).
+TRIBE_RATIO = float(os.environ.get("OFM_TRIBE_RATIO", "0"))
+BOTS = round(TRIBE_RATIO * NATIONS)
 # One difficulty is drawn per episode; repeat a name to weight it, e.g. "Medium,Medium,Hard".
 DIFFICULTIES = os.environ.get("OFM_DIFFICULTY", "Easy").split(",")
 DIFFICULTY = DIFFICULTIES[0]
@@ -690,7 +692,10 @@ def train():
             load_padded(agent, checkpoint["model"])
             try:
                 optimizer.load_state_dict(checkpoint["optimizer"])
+                if any(s["exp_avg"].shape != p.shape for p, s in ((p, optimizer.state[p]) for p in agent.parameters()) if s):
+                    raise ValueError("optimizer state shape mismatch")
             except (KeyError, TypeError, ValueError, RuntimeError):
+                optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
                 warmup_from_update = 0
                 print("optimizer state not restored, warming up the learning rate")
             print(f"resumed from {checkpoint_path}")
