@@ -55,7 +55,6 @@ CLIP_EPS = 0.2
 VALUE_COEF = 1.5
 ENTROPY_COEF = float(os.environ.get("OFM_ENTROPY_COEF", "0.08"))
 GATE_KL_COEF = float(os.environ.get("OFM_GATE_KL", "0.08"))
-TARGET_TAU = 0.03  # EMA rate of the target network used for GAE's value estimates
 
 # Anchor buffer: self-imitation on high-troop-ratio states that led to good returns.
 HIGH_RATIO_THRESHOLD = 0.35
@@ -400,8 +399,6 @@ def _mean(xs: list[float]) -> float:
 def ppo_update(
     rollout: Rollout,
     agent,
-    target_agent,
-    target_last_value: torch.Tensor,
     optimizer,
     update: int,
     total_train_hours: float,
@@ -420,11 +417,10 @@ def ppo_update(
     entity_masks = torch.from_numpy(rollout.entity_mask)
     actions = torch.from_numpy(rollout.actions)
     log_probs = torch.from_numpy(rollout.log_probs)
-    values = torch.from_numpy(rollout.values)
+    values = torch.from_numpy(rollout.values).float()
     rewards = torch.from_numpy(rollout.rewards)
     dones = torch.from_numpy(rollout.dones)
 
-    # GAE uses the slow-moving target network's values, in chunks to bound memory
     total = STEPS * rollout.num_envs
     flat_bool = bool_planes_buf.reshape(total, *bool_planes_buf.shape[2:])
     flat_owner = owner_grid_buf.reshape(total, *owner_grid_buf.shape[2:])
@@ -432,33 +428,18 @@ def ppo_update(
     flat_scalar = scalar_buf.reshape(total, *scalar_buf.shape[2:])
     flat_entities = entities_buf.reshape(total, *entities_buf.shape[2:])
     flat_entity_mask = entity_masks.reshape(total, *entity_masks.shape[2:])
-    flat_target_values = torch.zeros(total)
-    with torch.no_grad():
-        for start in range(0, total, MINIBATCH_SIZE):
-            idx = slice(start, start + MINIBATCH_SIZE)
-            chunk_scalar = flat_scalar[idx].to(DEVICE)
-            chunk_spatial = reconstruct_spatial_torch(
-                flat_bool[idx].to(DEVICE), flat_owner[idx].to(DEVICE).long(),
-                flat_ratio[idx].to(DEVICE).float(), chunk_scalar[:, 1], static_planes,
-            )
-            chunk_value = target_agent.get_value(
-                spatial=chunk_spatial, scalar=chunk_scalar,
-                entities=flat_entities[idx].to(DEVICE), entity_mask=flat_entity_mask[idx].to(DEVICE),
-            )
-            flat_target_values[idx] = chunk_value.squeeze(-1).cpu()
-    target_values = flat_target_values.reshape(STEPS, rollout.num_envs)
 
     running_advantage = torch.zeros(rollout.num_envs)
-    next_value = target_last_value
+    next_value = rollout.last_value
     advantages = torch.zeros(STEPS, rollout.num_envs)
     returns = torch.zeros(STEPS, rollout.num_envs)
     for t in reversed(range(STEPS)):
         non_term = 1 - dones[t].float()
-        delta = rewards[t] + (GAMMA * next_value * non_term) - target_values[t]
+        delta = rewards[t] + (GAMMA * next_value * non_term) - values[t]
         running_advantage = delta + (GAMMA * GAE_LAMBDA * non_term * running_advantage)
-        next_value = target_values[t]
+        next_value = values[t]
         advantages[t] = running_advantage
-        returns[t] = advantages[t] + target_values[t]
+        returns[t] = advantages[t] + values[t]
 
     frac_low_ratio = (scalar_buf.reshape(total, -1)[:, 1] < LOW_RATIO_THRESHOLD).float().mean().item()
     raw_advantage_mean = advantages.mean().item()
@@ -537,7 +518,6 @@ def ppo_update(
             batch_log_probs = log_probs[batch_idx].to(DEVICE)
             batch_advantages = advantages[batch_idx].to(DEVICE)
             batch_returns = returns[batch_idx].to(DEVICE)
-            batch_old_values = values[batch_idx].to(DEVICE)
 
             ratio = torch.exp(new_log_prob - batch_log_probs)
             with torch.no_grad():
@@ -548,10 +528,7 @@ def ppo_update(
             policy_loss = -torch.min(unclipped, clipped).mean()
 
             new_value = new_value.squeeze(-1)
-            value_loss_unclipped = torch.square((new_value - batch_returns) / return_std)
-            value_clipped = batch_old_values + torch.clamp(new_value - batch_old_values, -CLIP_EPS, CLIP_EPS)
-            value_loss_clipped = torch.square((value_clipped - batch_returns) / return_std)
-            value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+            value_loss = 0.5 * torch.square((new_value - batch_returns) / return_std).mean()
 
             if epoch == 0:
                 with torch.no_grad():
@@ -702,9 +679,6 @@ def train():
         else:
             warmup_from_update = 0
 
-        # target network for GAE's value estimates, restarted as a copy on every launch
-        target_agent = Agent.from_observation(episodes[0].spatial, episodes[0].scalar, episodes[0].entities).to(DEVICE)
-        target_agent.load_state_dict(agent.state_dict())
         anchor_buffer = AnchorBuffer(ANCHOR_BUFFER_CAPACITY)
         low_ratio_buffer = AnchorBuffer(LOW_RATIO_BUFFER_CAPACITY)
 
@@ -712,7 +686,6 @@ def train():
 
         for update in range(NUM_UPDATES):
             episodes, rollout = collect_rollout(vec_bridge, agent, episodes, gold_stats)
-            target_last_value = compute_value_for_episodes(target_agent, episodes)
 
             if warmup_from_update is not None:
                 since = update - warmup_from_update
@@ -723,10 +696,9 @@ def train():
                     warmup_from_update = None
 
             total_train_hours = ppo_update(
-                rollout, agent, target_agent, target_last_value, optimizer, update, total_train_hours,
+                rollout, agent, optimizer, update, total_train_hours,
                 return_stats, anchor_buffer, low_ratio_buffer,
             )
-            target_agent.soft_update_from(agent, TARGET_TAU)
             save_total_train_hours(total_train_hours)
             del rollout  # frees the buffers before the next rollout allocates its own
 
