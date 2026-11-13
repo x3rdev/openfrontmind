@@ -16,7 +16,7 @@ import torch
 @dataclass
 class AnchorBuffer:
     capacity: int
-    bool_planes: list = field(default_factory=list)
+    agent_id: list = field(default_factory=list)
     owner_grid: list = field(default_factory=list)
     ratio_table: list = field(default_factory=list)
     scalar: list = field(default_factory=list)
@@ -32,19 +32,18 @@ class AnchorBuffer:
 
     def insert(
         self,
-        bool_planes: np.ndarray, owner_grid: np.ndarray, ratio_table: np.ndarray,
+        agent_id: int, owner_grid: np.ndarray, ratio_table: np.ndarray,
         scalar: np.ndarray, entities: np.ndarray, entity_mask: np.ndarray,
         action: float, ret: float, update: int,
     ) -> None:
         """Overwrites the oldest slot once full."""
-        bool_planes = bool_planes.copy()
         owner_grid = owner_grid.copy()
         ratio_table = ratio_table.copy()
         scalar = scalar.copy()
         entities = entities.copy()
         entity_mask = entity_mask.copy()
         if len(self) < self.capacity:
-            self.bool_planes.append(bool_planes)
+            self.agent_id.append(agent_id)
             self.owner_grid.append(owner_grid)
             self.ratio_table.append(ratio_table)
             self.scalar.append(scalar)
@@ -55,7 +54,7 @@ class AnchorBuffer:
             self.inserted_at.append(update)
         else:
             slot = self._next_slot % self.capacity
-            self.bool_planes[slot] = bool_planes
+            self.agent_id[slot] = agent_id
             self.owner_grid[slot] = owner_grid
             self.ratio_table[slot] = ratio_table
             self.scalar[slot] = scalar
@@ -68,7 +67,7 @@ class AnchorBuffer:
 
     def insert_from_rollout(
         self,
-        bool_planes_buf: np.ndarray, owner_grid_buf: np.ndarray, ratio_table_buf: np.ndarray,
+        agent_id_buf: np.ndarray, owner_grid_buf: np.ndarray, ratio_table_buf: np.ndarray,
         scalar_buf: np.ndarray, entities_buf: np.ndarray, entity_mask_buf: np.ndarray,
         actions: np.ndarray, raw_advantages: np.ndarray, returns: np.ndarray,
         high_ratio_threshold: float, update: int, max_insertions: int,
@@ -87,7 +86,7 @@ class AnchorBuffer:
             candidates = np.array(random.sample(list(candidates), max_insertions))
         for i in candidates:
             self.insert(
-                bool_planes_buf[i], owner_grid_buf[i], ratio_table_buf[i],
+                agent_id_buf[i], owner_grid_buf[i], ratio_table_buf[i],
                 scalar_buf[i], entities_buf[i], entity_mask_buf[i],
                 actions[i], returns[i], update,
             )
@@ -95,7 +94,7 @@ class AnchorBuffer:
 
     def insert_low_ratio_from_rollout(
         self,
-        bool_planes_buf: np.ndarray, owner_grid_buf: np.ndarray, ratio_table_buf: np.ndarray,
+        agent_id_buf: np.ndarray, owner_grid_buf: np.ndarray, ratio_table_buf: np.ndarray,
         scalar_buf: np.ndarray, entities_buf: np.ndarray, entity_mask_buf: np.ndarray,
         actions: np.ndarray, returns: np.ndarray,
         low_ratio_threshold: float, update: int, max_insertions: int,
@@ -109,7 +108,7 @@ class AnchorBuffer:
             candidates = np.array(random.sample(list(candidates), max_insertions))
         for i in candidates:
             self.insert(
-                bool_planes_buf[i], owner_grid_buf[i], ratio_table_buf[i],
+                agent_id_buf[i], owner_grid_buf[i], ratio_table_buf[i],
                 scalar_buf[i], entities_buf[i], entity_mask_buf[i],
                 actions[i], returns[i], update,
             )
@@ -120,7 +119,7 @@ class AnchorBuffer:
         keep = [i for i, t in enumerate(self.inserted_at) if update - t <= max_age_updates]
         if len(keep) == len(self.inserted_at):
             return
-        self.bool_planes = [self.bool_planes[i] for i in keep]
+        self.agent_id = [self.agent_id[i] for i in keep]
         self.owner_grid = [self.owner_grid[i] for i in keep]
         self.ratio_table = [self.ratio_table[i] for i in keep]
         self.scalar = [self.scalar[i] for i in keep]
@@ -138,7 +137,7 @@ class AnchorBuffer:
             return None
         idx = np.random.randint(0, n, size=min(batch_size, n))
         return dict(
-            bool_planes=np.stack([self.bool_planes[i] for i in idx]),
+            agent_id=np.array([self.agent_id[i] for i in idx]),
             owner_grid=np.stack([self.owner_grid[i] for i in idx]),
             ratio_table=np.stack([self.ratio_table[i] for i in idx]),
             scalar=np.stack([self.scalar[i] for i in idx]),

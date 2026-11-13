@@ -42,6 +42,9 @@ const AUTO_CITY_MAX = 3;
 const AUTO_CITY_COOLDOWN_TICKS = 30;
 const AUTO_CITY_GRID_STRIDE = 8;
 
+// Construction deducts gold a tick after the intent, so builds must not be issued back to back.
+const BUILD_GAP_TICKS = 5;
+
 // Loads a vendored test map by folder name (tests/testdata/maps/).
 async function loadTestMap(name: string) {
   const dir = path.join(PROJECT_ROOT, name);
@@ -79,6 +82,8 @@ export interface HarnessSession {
   state: HarnessState;
   agentClientID: string;
   lastCityTick: number;
+  lastBuildTick: number;
+  builtCounts: Record<string, number>;
 }
 
 export async function reset(
@@ -187,7 +192,7 @@ export async function reset(
   state.packedTileUpdates = combined;
   state.unitUpdates = spawnUnitUpdates;
 
-  return { runner, game, state, agentClientID, lastCityTick: -Infinity };
+  return { runner, game, state, agentClientID, lastCityTick: -Infinity, lastBuildTick: -Infinity, builtCounts: {} };
 }
 
 export interface AttackTarget {
@@ -198,6 +203,8 @@ export interface AttackTarget {
   alreadyAttacking: boolean;
   // troops this player has committed to attacking the agent.
   attackingMeTroops: number;
+  // troops the agent currently has committed in active attacks on this target.
+  outgoingTroops: number;
 }
 
 export interface StepResult {
@@ -230,6 +237,11 @@ function computeAttackMask(
     outgoing.map((a) => (a.target().isPlayer() ? (a.target() as Player).id() : WILDERNESS_KEY)),
   );
   const outgoingTroops = outgoing.reduce((sum, a) => sum + a.troops(), 0);
+  const outgoingByTarget = new Map<string, number>();
+  for (const a of outgoing) {
+    const key = a.target().isPlayer() ? (a.target() as Player).id() : WILDERNESS_KEY;
+    outgoingByTarget.set(key, (outgoingByTarget.get(key) ?? 0) + a.troops());
+  }
 
   const incoming = agent.incomingAttacks().filter((a) => a.isActive());
   const incomingTroops = incoming.reduce((sum, a) => sum + a.troops(), 0);
@@ -246,12 +258,14 @@ function computeAttackMask(
           smallID: p.smallID(),
           alreadyAttacking: activeTargets.has(p.id()),
           attackingMeTroops: incomingByAttacker.get(p.id()) ?? 0,
+          outgoingTroops: outgoingByTarget.get(p.id()) ?? 0,
         }
       : {
           targetID: null,
           smallID: null,
           alreadyAttacking: activeTargets.has(WILDERNESS_KEY),
           attackingMeTroops: 0,
+          outgoingTroops: outgoingByTarget.get(WILDERNESS_KEY) ?? 0,
         },
   );
 
@@ -261,6 +275,7 @@ function computeAttackMask(
 // Builds a city at the buildable site nearest the centroid of the agent's territory.
 function autoCityIntent(session: HarnessSession): StampedIntent | null {
   const { game } = session;
+  if (game.ticks() - session.lastBuildTick < BUILD_GAP_TICKS) return null;
   const agent = game.playerByClientID(session.agentClientID);
   if (agent === null || !agent.isAlive()) return null;
   if (game.ticks() - session.lastCityTick < AUTO_CITY_COOLDOWN_TICKS) return null;
@@ -281,26 +296,55 @@ function autoCityIntent(session: HarnessSession): StampedIntent | null {
   for (const [x, y] of owned.slice(0, 20)) {
     const site = agent.canBuild(UnitType.City, map.ref(x, y));
     if (site !== false) {
-      session.lastCityTick = game.ticks();
+      session.lastCityTick = session.lastBuildTick = game.ticks();
       return { type: "build_unit", unit: UnitType.City, tile: site, clientID: session.agentClientID } as unknown as StampedIntent;
     }
   }
   return null;
 }
 
+const ACT_EVERY = Math.max(1, parseInt(process.env.OFM_ACT_EVERY ?? "1", 10));
+
 export function step(
   session: HarnessSession,
   intents: StampedIntent[] = [],
 ): StepResult {
   const { runner, game, state } = session;
-  if (AUTO_CITY) {
-    const build = autoCityIntent(session);
-    if (build !== null) intents = [...intents, build];
+  const tiles: Uint32Array[] = [];
+  const players: Float64Array[] = [];
+  const unitUpdates: UnitUpdate[] = [];
+  for (let j = 0; j < ACT_EVERY; j++) {
+    let turn = j === 0 ? intents : [];
+    if (AUTO_CITY) {
+      const build = autoCityIntent(session);
+      if (build !== null) turn = [...turn, build];
+    }
+    runner.addTurn({ turnNumber: state.turnNumber++, intents: turn });
+    const ok = runner.executeNextTick();
+    if (!ok || state.fatalError !== undefined) {
+      throw new Error(`game errored during step:\n${state.fatalError}`);
+    }
+    if (state.packedTileUpdates) tiles.push(state.packedTileUpdates);
+    if (state.packedPlayerUpdates) players.push(state.packedPlayerUpdates);
+    if (state.unitUpdates) unitUpdates.push(...state.unitUpdates);
+    if (game.getWinner() !== null) break;
   }
-  runner.addTurn({ turnNumber: state.turnNumber++, intents });
-  const ok = runner.executeNextTick();
-  if (!ok || state.fatalError !== undefined) {
-    throw new Error(`game errored during step:\n${state.fatalError}`);
+  const concat = <T extends Uint32Array | Float64Array>(ctor: new (n: number) => T, parts: T[]): T => {
+    const out = new ctor(parts.reduce((n, a) => n + a.length, 0));
+    let o = 0;
+    for (const a of parts) { out.set(a, o); o += a.length; }
+    return out;
+  };
+  state.packedTileUpdates = concat(Uint32Array, tiles);
+  state.packedPlayerUpdates = concat(Float64Array, players);
+  state.unitUpdates = unitUpdates;
+  const agentNow = game.playerByClientID(session.agentClientID);
+  if (agentNow !== null) {
+    for (const t of [UnitType.City]) {
+      const n = agentNow.unitCount(t);
+      if (n > (session.builtCounts[t] ?? 0)) console.log(`[built] ${t} #${n} tick=${game.ticks()}`);
+      session.builtCounts[t] = n;
+    }
   }
   const winner = game.getWinner();
   const { attackMask, outgoingTroops, incomingTroops } = computeAttackMask(game, session.agentClientID);

@@ -6,7 +6,7 @@ Tile packing, from GameImpl.recordTileUpdate and GameMap:
   terrainByte bit 7 (bit 23 of packed) is land
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -42,6 +42,40 @@ class EpisodeState:
     peak: float = 0.0
     difficulty: str = ""
     seed: str = ""
+    # per-target persistent memory, keyed by smallID (None = wilderness); see update_target_memory
+    attack_ema: dict = field(default_factory=dict)
+    last_attacking: dict = field(default_factory=dict)
+
+
+TARGET_EMA_DECAY = 0.99
+FOCUS_MIN_EMA = 0.05
+TICKS_SINCE_SCALE = 7.0  # log1p(1100 ticks)
+
+
+def update_target_memory(episode: EpisodeState, attack_mask: list, tick: int) -> dict:
+    """Tracks how long each target has been under attack, from the engine's own attack
+    state. Returns {key: (attack_ema, log_ticks_since_attacking, is_focus)}."""
+    for c in attack_mask:
+        key = c["smallID"]
+        attacking = float(c["alreadyAttacking"])
+        episode.attack_ema[key] = TARGET_EMA_DECAY * episode.attack_ema.get(key, 0.0) + (1 - TARGET_EMA_DECAY) * attacking
+        if attacking:
+            episode.last_attacking[key] = tick
+    present = [c["smallID"] for c in attack_mask]
+    # None is wilderness' own key, so "no focus" needs a separate sentinel
+    no_focus = object()
+    focus = max(present, key=lambda k: episode.attack_ema[k], default=no_focus)
+    if focus is not no_focus and episode.attack_ema[focus] < FOCUS_MIN_EMA:
+        focus = no_focus
+    memory = {}
+    for key in present:
+        since = tick - episode.last_attacking.get(key, 0)
+        memory[key] = (
+            episode.attack_ema[key],
+            min(np.log1p(since) / TICKS_SINCE_SCALE, 1.0),
+            float(focus is not no_focus and key == focus),
+        )
+    return memory
 
 
 def apply_tile_updates(
@@ -163,8 +197,10 @@ def apply_step(episode: EpisodeState, step_result: dict) -> tuple[np.ndarray, di
         episode.player_stats, episode.agent_small_id, total_land, episode.owner_grid,
         step_result["outgoingTroops"], step_result["incomingTroops"],
     )
+    memory = update_target_memory(episode, step_result["attackMask"], step_result["tick"])
     entity_features, episode.targets = build_entities(
         step_result["attackMask"], episode.player_stats, episode.player_types, total_land,
+        memory=memory,
         agent_ratio=curr_stats.get("troops", 0.0) / max(curr_stats.get("maxTroops", 1.0), 1),
         agent_troops=curr_stats.get("troops", 0.0), agent_tiles=curr_stats.get("tilesOwned", 0.0),
     )

@@ -26,20 +26,24 @@ def build_troop_advantage_plane(agent_small_id: int, ratio_table: np.ndarray, tr
 
 
 def reconstruct_spatial_torch(
-    bool_planes: torch.Tensor, owner_grid: torch.Tensor, ratio_table: torch.Tensor, agent_ratio: torch.Tensor,
+    agent_id: torch.Tensor, owner_grid: torch.Tensor, ratio_table: torch.Tensor, agent_ratio: torch.Tensor,
     static_planes: torch.Tensor,
 ) -> torch.Tensor:
     """Rebuilds the (B, 6, H, W) spatial tensor from the compressed rollout buffers.
 
-    bool_planes (B, 2, H, W) is [is_mine, is_enemy]; static_planes (2, H, W) is
-    [is_land, is_impassable], shared by the batch (the map never changes mid-episode);
+    agent_id (B,) long is the agent's owner id, from which is_mine/is_enemy are rebuilt;
+    static_planes (2, H, W) is [is_land, is_impassable], shared by the batch (the map never changes mid-episode);
     owner_grid (B, H, W) long; ratio_table (B, MAX_SMALL_ID); agent_ratio (B,)."""
     b, h, w = owner_grid.shape
     troop_ratio_plane = torch.gather(ratio_table, 1, owner_grid.reshape(b, h * w)).reshape(b, h, w)
     troop_advantage_plane = agent_ratio.view(b, 1, 1) - troop_ratio_plane
     static = static_planes.float().unsqueeze(0).expand(b, -1, -1, -1)
+    is_land = static_planes[0].bool().unsqueeze(0)
+    ids = agent_id.view(b, 1, 1)
+    is_mine = is_land & (owner_grid == ids)
+    is_enemy = is_land & (owner_grid != 0) & (owner_grid != ids)
     return torch.cat([
-        static, bool_planes.float(), troop_ratio_plane.unsqueeze(1), troop_advantage_plane.unsqueeze(1),
+        static, is_mine.unsqueeze(1).float(), is_enemy.unsqueeze(1).float(), troop_ratio_plane.unsqueeze(1), troop_advantage_plane.unsqueeze(1),
     ], dim=1)
 
 

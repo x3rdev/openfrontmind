@@ -22,9 +22,9 @@ def _prod_potential(stats: dict) -> float:
     return -PROD_COEF * (1.0 - _regen(stats.get("troops", 0.0), max_troops) / peak)
 
 
-def compute_reward(prev_stats: dict, curr_stats: dict, done: bool, won: bool, total_land: float, gamma: float) -> float:
+def compute_reward(prev_stats: dict, curr_stats: dict, done: bool, won: bool, total_land: float, gamma: float, ticks: int = 1) -> float:
     if done:
         return WIN_REWARD if won else LOSS_REWARD
     tile_gain = (curr_stats.get("tilesOwned", 0.0) - prev_stats.get("tilesOwned", 0.0)) / max(total_land, 1)
     shaping = gamma * _prod_potential(curr_stats) - _prod_potential(prev_stats)
-    return TILE_SCALE * tile_gain + shaping - TIME_COST_PER_TICK
+    return TILE_SCALE * tile_gain + shaping - TIME_COST_PER_TICK * ticks

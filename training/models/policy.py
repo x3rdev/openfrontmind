@@ -3,10 +3,13 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Beta, Categorical
+from torch.distributions import Categorical, Distribution
 
-SIZE_MIN, SIZE_MAX = 0.01, 0.999
+Distribution.set_default_validate_args(False)
+
+SIZE_BINS = (0.01, 0.02, 0.04, 0.08, 0.15, 0.3, 0.6)
+SIZE_INIT_PROBS = (0.25, 0.25, 0.2, 0.15, 0.1, 0.04, 0.01)
+ABLATE = set(os.environ.get("OFM_ABLATE", "").split(","))  # temporary test switch
 RESERVE_FLOOR = float(os.environ.get("OFM_RESERVE_FLOOR", "0.2"))
 CONV_OUT_CHANNELS = 32
 POOL_SIZE = 16
@@ -57,6 +60,8 @@ class Backbone(nn.Module):
     def forward(
         self, spatial: torch.Tensor, scalar: torch.Tensor, entities: torch.Tensor, entity_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if "spatial" in ABLATE:
+            spatial = torch.zeros_like(spatial)
         pooled_conv = self.pool(self.conv_stack(spatial)).flatten(start_dim=1)
         entity_context, entity_embeds = self.entity_encoder(entities, entity_mask)
         combined = torch.cat([pooled_conv, scalar, entity_context], dim=1)
@@ -77,10 +82,11 @@ class Agent(nn.Module):
         )
         self.query_proj = nn.Linear(256, entity_embed_dim)
         self.gate_head = nn.Linear(256 + scalar_dim, 2)  # logits: [wait, act]
-        self.size_head = nn.Linear(256 + scalar_dim + entity_embed_dim, 2)
+        self.register_buffer("size_bins", torch.tensor(SIZE_BINS), persistent=False)
+        self.size_head = nn.Linear(256 + scalar_dim + entity_embed_dim, len(SIZE_BINS))
         nn.init.zeros_(self.size_head.weight)
         with torch.no_grad():
-            self.size_head.bias.copy_(torch.tensor([0.5413, 6.0025]))  # starts as Beta(2, 7)
+            self.size_head.bias.copy_(torch.log(torch.tensor(SIZE_INIT_PROBS)))
         self.reserve_floor = RESERVE_FLOOR
         self.gate_kl = None
 
@@ -134,21 +140,25 @@ class Agent(nn.Module):
         ref_logp = torch.log(torch.stack([1 - ref_act, ref_act], dim=-1))
         self.gate_kl = (gate_dist.probs * (gate_dist.logits - ref_logp)).sum(dim=-1)
 
+        action_was_sampled = action is None
         if action is None:
             gate_action = gate_dist.sample()
             target_action = target_dist.sample()
             action = torch.where(gate_action == torch.tensor(1), target_action, do_nothing_idx)
             size_dist = self._size_dist(hidden, scalar, entity_embeds, action)
-            size_action = size_dist.sample().clamp(SIZE_MIN, SIZE_MAX)
+            size_action = self.size_bins[size_dist.sample()]
             size_action = torch.where(action == do_nothing_idx, torch.full_like(size_action, 0.5), size_action)
             action_out = action.double() + size_action.double()
         else:
             action_out = action
             target_idx = torch.floor(action).long()
-            size_action = (action - target_idx.to(action.dtype)).float().clamp(SIZE_MIN, SIZE_MAX)
+            size_frac = (action - target_idx.to(action.dtype)).float()
+            size_action = (size_frac.unsqueeze(-1) - self.size_bins).abs().argmin(dim=-1)
             action = target_idx
             size_dist = self._size_dist(hidden, scalar, entity_embeds, action)
 
+        if action_was_sampled:
+            size_action = (size_action.unsqueeze(-1) - self.size_bins).abs().argmin(dim=-1)
         acted = (action != do_nothing_idx).long()
         log_prob = gate_dist.log_prob(acted) + acted.float() * (
             target_dist.log_prob(action) + size_dist.log_prob(size_action)
@@ -173,8 +183,7 @@ class Agent(nn.Module):
 
     def _size_dist(self, hidden, scalar, entity_embeds, target_idx):
         emb = entity_embeds[torch.arange(entity_embeds.shape[0], device=entity_embeds.device), target_idx]
-        raw = self.size_head(torch.cat([hidden, scalar, emb], dim=-1))
-        return Beta(1.0 + F.softplus(raw[:, 0]), 1.0 + F.softplus(raw[:, 1]))
+        return Categorical(logits=self.size_head(torch.cat([hidden, scalar, emb], dim=-1)))
 
 
 def load_padded(agent: nn.Module, state: dict) -> None:
@@ -184,7 +193,10 @@ def load_padded(agent: nn.Module, state: dict) -> None:
     fixed = {}
     for k, v in state.items():
         t = own.get(k)
+        if k.startswith("size_head") and t is not None and t.shape != v.shape:
+            continue  # size head changed shape (Beta -> categorical); keep its fresh init
         if t is not None and v.ndim == 2 and t.shape[0] == v.shape[0] and t.shape[1] > v.shape[1]:
             v = torch.cat([v, torch.zeros(v.shape[0], t.shape[1] - v.shape[1], dtype=v.dtype, device=v.device)], dim=1)
         fixed[k] = v
-    agent.load_state_dict(fixed)
+    missing = agent.load_state_dict(fixed, strict=False).missing_keys
+    assert all(k.startswith("size_head") for k in missing), missing

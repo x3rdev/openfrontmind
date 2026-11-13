@@ -5,12 +5,16 @@ row of an entity feature array, padded to MAX_ENTITIES. The network scores rows 
 features (policy.py), so row order carries no meaning. do-nothing is an all-zero row.
 """
 
+import os
+
 import numpy as np
+
+ABLATE = set(os.environ.get("OFM_ABLATE", "").split(","))  # temporary test switch
 
 # [is_tribe, is_nation, is_wilderness, is_do_nothing, tile_fraction, log_gold, troop_ratio,
 #  attacking_me_ratio, already_attacking, agent_ratio - troop_ratio,
 #  log(their troops / my troops), log(their troops per tile / mine)]
-ENTITY_FEATURES = 12
+ENTITY_FEATURES = 16
 MAX_ENTITIES = 16  # buffer size; excess candidates are dropped for that tick
 
 DO_NOTHING = object()  # sentinel target, distinct from a real id or wilderness (None)
@@ -19,15 +23,25 @@ DO_NOTHING = object()  # sentinel target, distinct from a real id or wilderness 
 def build_entities(
     attack_mask: list, player_stats: dict, player_types: dict, total_land: float,
     agent_ratio: float = 0.0, agent_troops: float = 0.0, agent_tiles: float = 0.0,
+    memory: dict | None = None,
 ) -> tuple[np.ndarray, list]:
     """Returns (features, targets): one row per candidate plus a final do-nothing row,
-    and the matching target for action_to_intents."""
+    and the matching target for action_to_intents.
+
+    Candidates are sorted by smallID (wilderness first) so a target keeps its row.
+    `memory` maps a target key (smallID or None) to its persistent features."""
+    memory = memory or {}
+    attack_mask = sorted(attack_mask, key=lambda c: -1 if c["targetID"] is None else c["smallID"])
     rows = []
     targets = []
     agent_density = agent_troops / max(agent_tiles, 1)
     for c in attack_mask:
         # re-attacking a target merges into the existing attack, so these rows stay legal
         already_attacking = float(c["alreadyAttacking"])
+        committed = min(c.get("outgoingTroops", 0.0) / max(agent_troops, 1.0), 1.0)
+        persist = [*memory.get(c["smallID"], (0.0, 1.0, 0.0)), committed]
+        if "persist" in ABLATE:
+            persist = [0.0] * 4
         if c["targetID"] is not None:
             stats = player_stats.get(c["smallID"], {})
             ptype = player_types.get(c["smallID"], "BOT")
@@ -50,13 +64,14 @@ def build_entities(
                 agent_ratio - troop_ratio,
                 float(np.log((their_troops + 1) / (agent_troops + 1))),
                 float(np.log((their_density + 1) / (agent_density + 1))),
+                *persist,
             ])
             targets.append(c["targetID"])
         else:
-            rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, already_attacking, 0.0, 0.0, 0.0])
+            rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, already_attacking, 0.0, 0.0, 0.0, *persist])
             targets.append(None)
 
-    rows.append([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    rows.append([0.0, 0.0, 0.0, 1.0] + [0.0] * (ENTITY_FEATURES - 4))
     targets.append(DO_NOTHING)
 
     return np.array(rows, dtype=np.float32), targets
