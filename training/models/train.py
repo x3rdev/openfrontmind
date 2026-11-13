@@ -15,14 +15,13 @@ from training.envs.action_space import build_entities, pad_entities, action_to_i
 from training.envs.reward import compute_reward
 from training.envs.running_stats import RunningMeanStd
 from training.models.policy import Agent
-from training.models.anchor_buffer import AnchorBuffer
 
 # Rollout length per env. Games continue across updates; NUM_ENVS is bounded by RAM (the
 # buffers store every tick).
 STEPS = int(os.environ.get("OFM_STEPS", "6500"))
 NUM_UPDATES = 10000
 NUM_ENVS = int(os.environ.get("OFM_NUM_ENVS", "10"))
-MAX_EPISODE_TICKS = 10000  # episodes still running here end; the highest tile share wins
+MAX_EPISODE_TICKS = 30000  # episodes still running here end; the highest tile share wins
 CAP_FLAG_FRAC = 0.05  # warn when more than this share of an update's episodes hit the cap
 
 NATIONS = int(os.environ.get("OFM_NATIONS", "5"))
@@ -51,15 +50,7 @@ MINIBATCH_SIZE = 256
 CLIP_EPS = 0.2
 VALUE_COEF = 1.5
 GATE_KL_COEF = float(os.environ.get("OFM_GATE_KL", "0.08"))
-
-# Low-ratio buffer: keeps the value head calibrated on depleted states.
-LOW_RATIO_THRESHOLD = 0.15
-LOW_RATIO_BUFFER_CAPACITY = 500
-LOW_RATIO_MAX_INSERT_PER_UPDATE = 32
-LOW_RATIO_MAX_AGE_UPDATES = 300
-LOW_RATIO_MIN_FILL = 10 ** 9 if "lowratio" in os.environ.get("OFM_ABLATE", "") else 64
-LOW_RATIO_MINIBATCH_SIZE = 64
-LOW_RATIO_COEF = 0.02
+ENTROPY_COEF = float(os.environ.get("OFM_ENTROPY_COEF", "0"))
 
 
 def load_total_train_hours() -> float:
@@ -290,7 +281,7 @@ def collect_rollout(
                 capped_count += 1
             dones[i, k] = done
             wins[i, k] = won
-            rewards[i, k] = compute_reward(prev_stats, curr_stats, done, won, step_result["totalLand"], GAMMA_STEP, ACT_EVERY)
+            rewards[i, k] = compute_reward(prev_stats, curr_stats, done, won, step_result["totalLand"], GAMMA_STEP)
 
             _apply_gold_stats(episode.scalar, entity_features, gold_stats)
             episode.entities, episode.entity_mask = pad_entities(entity_features)
@@ -354,7 +345,6 @@ def ppo_update(
     update: int,
     total_train_hours: float,
     return_stats: RunningMeanStd,
-    low_ratio_buffer: AnchorBuffer,
 ) -> float:
     agent_id_buf = torch.from_numpy(rollout.agent_ids)
     static_planes = torch.from_numpy(rollout.static_planes).to(DEVICE)
@@ -407,14 +397,6 @@ def ppo_update(
     returns = returns.reshape(total)
     values = values.reshape(total)
 
-    low_ratio_buffer.evict_older_than(update, LOW_RATIO_MAX_AGE_UPDATES)
-    low_ratio_inserted = low_ratio_buffer.insert_low_ratio_from_rollout(
-        agent_id_buf.numpy(), owner_grid_buf.numpy(), ratio_table_buf.numpy(),
-        scalar_buf.numpy(), entities_buf.numpy(), entity_masks.numpy(),
-        actions.numpy(), returns.numpy(),
-        LOW_RATIO_THRESHOLD, update, LOW_RATIO_MAX_INSERT_PER_UPDATE,
-    )
-
     rollout_elapsed = rollout.elapsed
     ppo_start = time.perf_counter()
 
@@ -424,7 +406,6 @@ def ppo_update(
     gate_kl_sum = 0.0
     num_minibatches = 0
     approx_kl = 0.0
-    low_ratio_loss_sum, low_ratio_steps = 0.0, 0
 
     for epoch in range(PPO_EPOCHS):
         indices = torch.randperm(total)
@@ -463,7 +444,7 @@ def ppo_update(
 
             entropy_mean = entropy.mean()
             gate_kl_mean = agent.gate_kl.mean()
-            loss = policy_loss + VALUE_COEF * value_loss + GATE_KL_COEF * gate_kl_mean
+            loss = policy_loss + VALUE_COEF * value_loss + GATE_KL_COEF * gate_kl_mean - ENTROPY_COEF * entropy_mean
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
@@ -474,30 +455,6 @@ def ppo_update(
             entropy_sum += entropy_mean.item()
             gate_kl_sum += gate_kl_mean.item()
             num_minibatches += 1
-
-        low_ratio_batch = low_ratio_buffer.sample(LOW_RATIO_MINIBATCH_SIZE) if len(low_ratio_buffer) >= LOW_RATIO_MIN_FILL else None
-        if low_ratio_batch is not None:
-            lr_scalar = torch.from_numpy(low_ratio_batch["scalar"]).to(DEVICE)
-            lr_spatial = reconstruct_spatial_torch(
-                torch.from_numpy(low_ratio_batch["agent_id"]).to(DEVICE).long(),
-                torch.from_numpy(low_ratio_batch["owner_grid"]).to(DEVICE).long(),
-                torch.from_numpy(low_ratio_batch["ratio_table"]).to(DEVICE).float(),
-                lr_scalar[:, 1], static_planes,
-            )
-            lr_return = torch.from_numpy(low_ratio_batch["ret"]).to(DEVICE)
-            lr_value = agent.get_value(
-                spatial=lr_spatial, scalar=lr_scalar,
-                entities=torch.from_numpy(low_ratio_batch["entities"]).to(DEVICE),
-                entity_mask=torch.from_numpy(low_ratio_batch["entity_mask"]).to(DEVICE),
-            ).squeeze(-1)
-            low_ratio_loss = LOW_RATIO_COEF * VALUE_COEF * 0.5 * (((lr_return - lr_value) / return_std) ** 2).mean()
-
-            optimizer.zero_grad()
-            low_ratio_loss.backward()
-            torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
-            optimizer.step()
-            low_ratio_loss_sum += low_ratio_loss.item()
-            low_ratio_steps += 1
 
     ppo_elapsed = time.perf_counter() - ppo_start
     total_train_hours += (rollout_elapsed + ppo_elapsed) / 3600
@@ -554,8 +511,6 @@ def train():
         else:
             warmup_from_update = 0
 
-        low_ratio_buffer = AnchorBuffer(LOW_RATIO_BUFFER_CAPACITY)
-
         print(f"training on device={DEVICE}, num_envs={NUM_ENVS}, nations={NATIONS}, difficulty={DIFFICULTIES}")
 
         for update in range(NUM_UPDATES):
@@ -571,7 +526,7 @@ def train():
 
             total_train_hours = ppo_update(
                 rollout, agent, optimizer, update, total_train_hours,
-                return_stats, low_ratio_buffer,
+                return_stats,
             )
             save_total_train_hours(total_train_hours)
             del rollout  # frees the buffers before the next rollout allocates its own

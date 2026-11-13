@@ -140,6 +140,7 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       outgoingTroops: result.outgoingTroops,
       incomingTroops: result.incomingTroops,
       unitUpdates: result.unitUpdates,
+      alliances: session.state.alliances,
       maxTroops: maxTroopsBySmallID(session),
       totalLand: totalLand(session),
     });

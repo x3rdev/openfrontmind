@@ -159,6 +159,10 @@ def main(
                 "peak_tile_fraction": peak_tile_fraction,
                 "peak_tick": peak_tick,
             }
+            alliances = step_result.get("alliances", [])
+            agent_alliances = sum(episode.agent_small_id in (a["a"], a["b"]) for a in alliances)
+            nation_alliances = len(alliances) - agent_alliances
+            first_alliance = min((a["tick"] for a in alliances), default=None)
             print(
                 f"[diagnostic] seed={seed} winner={step_result['winner']} won={summary['won']} "
                 f"ticks={i} do_nothing={do_nothing_ticks} attack={attack_ticks} "
@@ -166,7 +170,8 @@ def main(
                 f"{first_attack_troop_ratio if first_attack_troop_ratio is None else f'{first_attack_troop_ratio:.3f}'} "
                 f"mean_attack_troop_ratio="
                 f"{mean_attack_troop_ratio if mean_attack_troop_ratio is None else f'{mean_attack_troop_ratio:.3f}'} "
-                f"peak_tile_fraction={peak_tile_fraction:.3f}@{peak_tick}"
+                f"peak_tile_fraction={peak_tile_fraction:.3f}@{peak_tick} "
+                f"alliances_nation_nation={nation_alliances} alliances_with_agent={agent_alliances} first_alliance_tick={first_alliance}"
             )
             return summary
 

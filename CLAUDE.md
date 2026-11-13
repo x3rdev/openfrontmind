@@ -1031,12 +1031,9 @@ before the cleanup (decision/tau format, PBT, old rewards) is at git tag `pre-cl
 - **Action:** each tick a gate (wait/act), a pointer over bordering targets, and a Beta
   attack size (fraction of current troops). Gate is regularised by KL to a patient
   reference gate, not an entropy bonus.
-- **Reserve floor:** attacking is blocked below troop ratio 0.2 (`OFM_RESERVE_FLOOR`).
-  This stopped the recurring collapse: from the same checkpoint, two runs without it
-  collapsed in under 15 updates, one with it ran 160+ updates at ~100% wins (5 Easy
-  Nations).
-- **Reward:** tile gain x100, +-150 win/loss, 0.01/tick time cost, potential-based
-  shaping on lost troop production. Removing the time cost did not prevent collapse.
+- **Reserve floor:** attacking is blocked below troop ratio 0.2 (`OFM_RESERVE_FLOOR`). Removing it from scratch gave 0/657 wins in 87 updates vs 32% for the control at the same point, so it stays.
+- **Reward:** tile gain x100, +-150 win/loss, potential-based
+  shaping on lost troop production.
 - **Gate-bias sweep** (act logit +0.5/+1/+1.5): wins fall 83% -> 67% -> 25-33%. The safe
   band for the act rate is narrow, which is why drift collapsed the policy.
 - **Limits:** 8/8 wins on Easy, 0/16 on 5 Hard Nations and 0/16 on 1v1 Hard (agent
