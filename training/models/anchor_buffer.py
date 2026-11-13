@@ -1,16 +1,9 @@
-"""Ring buffer of single timesteps, used twice in train.py: as an anchor buffer of
-high-troop-ratio states that led to good returns (self-imitation), and as a low-ratio
-buffer that keeps the value head calibrated on depleted states.
-
-The anchor loss is supervised toward a fixed (state, action, return) triple, weighted by
-max(0, return - V(s)) with the weight detached, so old entries need no importance correction.
-"""
+"""Ring buffer of low-troop-ratio timesteps that keeps the value head calibrated on depleted states."""
 
 import random
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch
 
 
 @dataclass
@@ -64,33 +57,6 @@ class AnchorBuffer:
             self.ret[slot] = ret
             self.inserted_at[slot] = update
             self._next_slot += 1
-
-    def insert_from_rollout(
-        self,
-        agent_id_buf: np.ndarray, owner_grid_buf: np.ndarray, ratio_table_buf: np.ndarray,
-        scalar_buf: np.ndarray, entities_buf: np.ndarray, entity_mask_buf: np.ndarray,
-        actions: np.ndarray, raw_advantages: np.ndarray, returns: np.ndarray,
-        high_ratio_threshold: float, update: int, max_insertions: int,
-        high_ratio_ceiling: float = float("inf"),
-    ) -> int:
-        """Inserts a capped random sample of timesteps with a troop ratio inside
-        [high_ratio_threshold, high_ratio_ceiling] and positive raw advantage.
-        The ceiling stops the buffer rewarding ever-longer waits. Returns the number inserted."""
-        candidates = np.nonzero(
-            (scalar_buf[:, 1] >= high_ratio_threshold) & (scalar_buf[:, 1] <= high_ratio_ceiling)
-            & (raw_advantages > 0)
-        )[0]
-        if candidates.size == 0:
-            return 0
-        if candidates.size > max_insertions:
-            candidates = np.array(random.sample(list(candidates), max_insertions))
-        for i in candidates:
-            self.insert(
-                agent_id_buf[i], owner_grid_buf[i], ratio_table_buf[i],
-                scalar_buf[i], entities_buf[i], entity_mask_buf[i],
-                actions[i], returns[i], update,
-            )
-        return int(candidates.size)
 
     def insert_low_ratio_from_rollout(
         self,

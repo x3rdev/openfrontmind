@@ -69,8 +69,8 @@ class Backbone(nn.Module):
 
 
 class Agent(nn.Module):
-    """Each tick: a gate (wait or act), a pointer over candidate targets, and a Beta
-    attack size. The action is encoded as target_index + size_fraction in one float."""
+    """Each tick: a gate (wait or act), a pointer over candidate targets, and a
+    categorical attack size. The action is encoded as target_index + size_fraction in one float."""
 
     def __init__(self, spatial_channels: int, scalar_dim: int, entity_dim: int, entity_embed_dim: int = 64):
         super().__init__()
@@ -100,12 +100,6 @@ class Agent(nn.Module):
         hidden, _ = self.backbone(spatial, scalar, entities, entity_mask)
         return self.value_head(torch.cat([hidden, scalar], dim=-1))
 
-    def soft_update_from(self, source: "Agent", tau: float) -> None:
-        """EMA update toward the source's weights."""
-        with torch.no_grad():
-            for target_param, source_param in zip(self.parameters(), source.parameters()):
-                target_param.mul_(1 - tau).add_(source_param, alpha=tau)
-
     def get_action_and_value(
         self,
         spatial: torch.Tensor,
@@ -113,11 +107,9 @@ class Agent(nn.Module):
         entities: torch.Tensor,
         entity_mask: torch.Tensor,
         action: torch.Tensor | None = None,
-        return_probs: bool = False,
-        return_entropy_components: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Samples an action when `action` is None, otherwise scores the given one.
-        Returns (action, log_prob, entropy, value), plus optional extras."""
+        Returns (action, log_prob, entropy, value)."""
         hidden, entity_embeds = self.backbone(spatial, scalar, entities, entity_mask)
         troop_ratio = scalar[:, 1]
 
@@ -171,32 +163,8 @@ class Agent(nn.Module):
         p_act = gate_dist.probs[:, 1]
         entropy = p_act * normalized_target_entropy + p_act.detach() * size_dist.entropy()
 
-        result = (action_out, log_prob, entropy, self.value_head(torch.cat([hidden, scalar], dim=-1)))
-        if return_probs:
-            # p(do_nothing) = p(wait), p(candidate j) = p(act) * p(target = j | act)
-            flat_probs = gate_dist.probs[:, 1:2] * target_dist.probs
-            flat_probs = torch.where(is_do_nothing, gate_dist.probs[:, 0:1].expand_as(flat_probs), flat_probs)
-            result = result + (flat_probs,)
-        if return_entropy_components:
-            result = result + (gate_dist.entropy(), target_dist.entropy(), num_candidates)
-        return result
+        return action_out, log_prob, entropy, self.value_head(torch.cat([hidden, scalar], dim=-1))
 
     def _size_dist(self, hidden, scalar, entity_embeds, target_idx):
         emb = entity_embeds[torch.arange(entity_embeds.shape[0], device=entity_embeds.device), target_idx]
         return Categorical(logits=self.size_head(torch.cat([hidden, scalar, emb], dim=-1)))
-
-
-def load_padded(agent: nn.Module, state: dict) -> None:
-    """load_state_dict that zero-pads input columns of 2-D weights, so a checkpoint from
-    before new entity features were added loads with those features starting inert."""
-    own = agent.state_dict()
-    fixed = {}
-    for k, v in state.items():
-        t = own.get(k)
-        if k.startswith("size_head") and t is not None and t.shape != v.shape:
-            continue  # size head changed shape (Beta -> categorical); keep its fresh init
-        if t is not None and v.ndim == 2 and t.shape[0] == v.shape[0] and t.shape[1] > v.shape[1]:
-            v = torch.cat([v, torch.zeros(v.shape[0], t.shape[1] - v.shape[1], dtype=v.dtype, device=v.device)], dim=1)
-        fixed[k] = v
-    missing = agent.load_state_dict(fixed, strict=False).missing_keys
-    assert all(k.startswith("size_head") for k in missing), missing

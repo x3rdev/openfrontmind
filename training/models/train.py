@@ -14,9 +14,8 @@ from training.envs.observation import encode_observation, reconstruct_spatial_to
 from training.envs.action_space import build_entities, pad_entities, action_to_intents, DO_NOTHING
 from training.envs.reward import compute_reward
 from training.envs.running_stats import RunningMeanStd
-from training.models.policy import Agent, load_padded
+from training.models.policy import Agent
 from training.models.anchor_buffer import AnchorBuffer
-from training.models.expert import expert_actions
 
 # Rollout length per env. Games continue across updates; NUM_ENVS is bounded by RAM (the
 # buffers store every tick).
@@ -27,16 +26,9 @@ MAX_EPISODE_TICKS = 10000  # episodes still running here end; the highest tile s
 CAP_FLAG_FRAC = 0.05  # warn when more than this share of an update's episodes hit the cap
 
 NATIONS = int(os.environ.get("OFM_NATIONS", "5"))
-# Tribes per Nation; real lobbies run 400 Tribes against 61 Nations on `world` (6.6:1) and 97 on `giantworldmap` (4.1:1).
-TRIBE_RATIO = float(os.environ.get("OFM_TRIBE_RATIO", "0"))
-BOTS = round(TRIBE_RATIO * NATIONS)
 # One difficulty is drawn per episode; repeat a name to weight it, e.g. "Medium,Medium,Hard".
 DIFFICULTIES = os.environ.get("OFM_DIFFICULTY", "Easy").split(",")
 DIFFICULTY = DIFFICULTIES[0]
-FIXED_SEED = os.environ.get("OFM_FIXED_SEED")  # set to replay one map/spawn/Nation every episode
-SEED_POOL = int(os.environ.get("OFM_SEED_POOL", "0"))  # if set, episodes draw from this many fixed seeds
-REPLAY_PROB = float(os.environ.get("OFM_REPLAY_PROB", "0"))
-WON_SEEDS: set[str] = set()  # seeds of won games, replayed until lost
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -58,21 +50,7 @@ PPO_EPOCHS = 2
 MINIBATCH_SIZE = 256
 CLIP_EPS = 0.2
 VALUE_COEF = 1.5
-ENTROPY_COEF = float(os.environ.get("OFM_ENTROPY_COEF", "0.08"))
 GATE_KL_COEF = float(os.environ.get("OFM_GATE_KL", "0.08"))
-# Imitation of the scripted rule (expert.py) on the learner's own states; PG_COEF=0 gives pure imitation.
-BC_COEF = float(os.environ.get("OFM_BC_COEF", "0"))
-PG_COEF = float(os.environ.get("OFM_PG_COEF", "1"))
-
-# Anchor buffer: self-imitation on high-troop-ratio states that led to good returns.
-HIGH_RATIO_THRESHOLD = 0.35
-HIGH_RATIO_CEILING = 0.60
-ANCHOR_BUFFER_CAPACITY = 500
-ANCHOR_MAX_INSERT_PER_UPDATE = 32
-ANCHOR_MAX_AGE_UPDATES = 300
-ANCHOR_MIN_FILL = 64
-ANCHOR_MINIBATCH_SIZE = 64
-ANCHOR_COEF = 0.02
 
 # Low-ratio buffer: keeps the value head calibrated on depleted states.
 LOW_RATIO_THRESHOLD = 0.15
@@ -148,11 +126,7 @@ class Rollout:
     num_envs: int
     episodes_finished: int
     episode_wins: int
-    episode_end_golds_win: list[float]
-    episode_end_golds_loss: list[float]
     wins_by_setup: dict[str, list[int]]
-    end_structs_win: list[dict]
-    end_structs_loss: list[dict]
     end_records: list[tuple]
     elapsed: float
 
@@ -205,14 +179,10 @@ def _episode_state_from_setup(setup: dict, gold_stats: RunningMeanStd) -> Episod
 
 def start_episode(bridge, gold_stats: RunningMeanStd) -> EpisodeState:
     difficulty = random.choice(DIFFICULTIES)
-    if WON_SEEDS and random.random() < REPLAY_PROB:
-        seed = random.choice(list(WON_SEEDS))
-    else:
-        seed = FIXED_SEED or (f"pool{random.randrange(SEED_POOL)}" if SEED_POOL else str(random.randint(0, 2 ** 31 - 1)))
+    seed = str(random.randint(0, 2 ** 31 - 1))
     setup = bridge.reset(
         seed=seed,
         map="mid_plains",
-        bots=BOTS,
         nations=NATIONS,
         difficulty=difficulty,
     )
@@ -260,11 +230,7 @@ def collect_rollout(
     rewards = np.zeros((STEPS, num_envs))
     dones = np.zeros((STEPS, num_envs), dtype=np.bool)
     wins = np.zeros((STEPS, num_envs), dtype=np.bool)
-    episode_end_golds_win = []
-    episode_end_golds_loss = []
     wins_by_setup: dict[str, list[int]] = {}
-    end_structs_win: list[dict] = []
-    end_structs_loss: list[dict] = []
     end_records: list[tuple] = []
 
     capped_count = 0
@@ -330,28 +296,12 @@ def collect_rollout(
             episode.entities, episode.entity_mask = pad_entities(entity_features)
 
             if done:
-                # an eliminated player's gold reads 0 at the end, so use the previous tick for losses
-                end_gold = curr_stats.get("gold", 0.0) if won else prev_stats.get("gold", curr_stats.get("gold", 0.0))
-                (episode_end_golds_win if won else episode_end_golds_loss).append(end_gold)
                 kind = "cap" if capped else "win" if won else "other" if step_result.get("winner") else "elim"
                 end_records.append((kind, episode.ticks, episode.peak))
-                structs = step_result.get("structures")
-                if structs:
-                    nation_ids = [sid for sid, t in episode.player_types.items() if t == "NATION"]
-                    agg: dict = {}
-                    for sid in nation_ids:
-                        for name, c in structs.get(str(sid), {}).items():
-                            agg[name] = agg.get(name, 0) + c
-                    n_nat = max(len(nation_ids), 1)
-                    (end_structs_win if won else end_structs_loss).append({name: c / n_nat for name, c in agg.items()})
                 num_nations = sum(1 for t in episode.player_types.values() if t == "NATION")
                 bucket = wins_by_setup.setdefault(f"{num_nations}{episode.difficulty[:1]}", [0, 0])
                 bucket[1] += 1
-                if won:
-                    bucket[0] += 1
-                    WON_SEEDS.add(episode.seed)
-                else:
-                    WON_SEEDS.discard(episode.seed)
+                bucket[0] += int(won)
                 episodes[k] = start_episode(vec_bridge.bridges[k], gold_stats)
 
     if capped_count > CAP_FLAG_FRAC * max(int(dones.sum()), 1):
@@ -380,11 +330,7 @@ def collect_rollout(
         num_envs=num_envs,
         episodes_finished=int(dones.sum().item()),
         episode_wins=int(wins.sum().item()),
-        episode_end_golds_win=episode_end_golds_win,
-        episode_end_golds_loss=episode_end_golds_loss,
         wins_by_setup=wins_by_setup,
-        end_structs_win=end_structs_win,
-        end_structs_loss=end_structs_loss,
         end_records=end_records,
         elapsed=time.perf_counter() - rollout_start,
     )
@@ -401,16 +347,6 @@ def _ends_str(records: list[tuple]) -> str:
     return ";".join(out) or "-"
 
 
-def _structs_str(rows: list[dict]) -> str:
-    if not rows:
-        return "-"
-    return ",".join(f"{k}={sum(r.get(k, 0) for r in rows) / len(rows):.2f}" for k in rows[0])
-
-
-def _mean(xs: list[float]) -> float:
-    return sum(xs) / len(xs) if xs else 0.0
-
-
 def ppo_update(
     rollout: Rollout,
     agent,
@@ -418,11 +354,8 @@ def ppo_update(
     update: int,
     total_train_hours: float,
     return_stats: RunningMeanStd,
-    anchor_buffer: AnchorBuffer,
     low_ratio_buffer: AnchorBuffer,
 ) -> float:
-    params_before = torch.cat([p.detach().flatten() for p in agent.parameters()])
-
     agent_id_buf = torch.from_numpy(rollout.agent_ids)
     static_planes = torch.from_numpy(rollout.static_planes).to(DEVICE)
     owner_grid_buf = torch.from_numpy(rollout.owner_grid)
@@ -456,10 +389,6 @@ def ppo_update(
         advantages[t] = running_advantage
         returns[t] = advantages[t] + values[t]
 
-    frac_low_ratio = (scalar_buf.reshape(total, -1)[:, 1] < LOW_RATIO_THRESHOLD).float().mean().item()
-    raw_advantage_mean = advantages.mean().item()
-    raw_advantage_std = advantages.std().item()
-    raw_advantages_np = advantages.numpy().reshape(-1).copy()
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     # value errors are scaled by a running return std; rare wins have much larger returns than losses
@@ -478,17 +407,6 @@ def ppo_update(
     returns = returns.reshape(total)
     values = values.reshape(total)
 
-    # anchor buffer disabled (replaced by seed replay); empty buffer skips the anchor step
-    # anchor_buffer.evict_older_than(update, ANCHOR_MAX_AGE_UPDATES)
-    # anchor_inserted = anchor_buffer.insert_from_rollout(
-    #     agent_id_buf.numpy(), owner_grid_buf.numpy(), ratio_table_buf.numpy(),
-    #     scalar_buf.numpy(), entities_buf.numpy(), entity_masks.numpy(),
-    #     actions.numpy(), raw_advantages_np, returns.numpy(),
-    #     HIGH_RATIO_THRESHOLD, update, ANCHOR_MAX_INSERT_PER_UPDATE,
-    #     high_ratio_ceiling=HIGH_RATIO_CEILING,
-    # )
-    anchor_inserted = 0
-
     low_ratio_buffer.evict_older_than(update, LOW_RATIO_MAX_AGE_UPDATES)
     low_ratio_inserted = low_ratio_buffer.insert_low_ratio_from_rollout(
         agent_id_buf.numpy(), owner_grid_buf.numpy(), ratio_table_buf.numpy(),
@@ -501,16 +419,11 @@ def ppo_update(
     ppo_start = time.perf_counter()
 
     policy_loss_sum = 0.0
-    bc_loss_sum = 0.0
     value_loss_sum = 0.0
     entropy_sum = 0.0
     gate_kl_sum = 0.0
     num_minibatches = 0
     approx_kl = 0.0
-    # value error by troop-ratio bucket, measured on the first epoch only
-    low_ratio_err_sum, low_ratio_err_count = 0.0, 0
-    normal_err_sum, normal_err_count = 0.0, 0
-    anchor_loss_sum, anchor_steps = 0.0, 0
     low_ratio_loss_sum, low_ratio_steps = 0.0, 0
 
     for epoch in range(PPO_EPOCHS):
@@ -548,30 +461,9 @@ def ppo_update(
             new_value = new_value.squeeze(-1)
             value_loss = 0.5 * torch.square((new_value - batch_returns) / return_std).mean()
 
-            if epoch == 0:
-                with torch.no_grad():
-                    abs_err = (new_value - batch_returns).abs() / return_std
-                    low_mask = batch_scalar[:, 1] < LOW_RATIO_THRESHOLD
-                    if low_mask.any():
-                        low_ratio_err_sum += abs_err[low_mask].sum().item()
-                        low_ratio_err_count += int(low_mask.sum().item())
-                    if (~low_mask).any():
-                        normal_err_sum += abs_err[~low_mask].sum().item()
-                        normal_err_count += int((~low_mask).sum().item())
-
-            entropy_bonus = entropy.mean()
+            entropy_mean = entropy.mean()
             gate_kl_mean = agent.gate_kl.mean()
-            loss = PG_COEF * policy_loss + VALUE_COEF * value_loss - ENTROPY_COEF * entropy_bonus + GATE_KL_COEF * gate_kl_mean
-            if BC_COEF > 0:
-                half = batch_scalar.shape[0] // 2
-                expert = expert_actions(batch_scalar[:half], batch_entities[:half], batch_entity_mask[:half], agent.reserve_floor)
-                _, expert_log_prob, _, _ = agent.get_action_and_value(
-                    spatial=batch_spatial[:half], scalar=batch_scalar[:half],
-                    entities=batch_entities[:half], entity_mask=batch_entity_mask[:half], action=expert,
-                )
-                bc_loss = -expert_log_prob.mean()
-                loss = loss + BC_COEF * bc_loss
-                bc_loss_sum += bc_loss.item()
+            loss = policy_loss + VALUE_COEF * value_loss + GATE_KL_COEF * gate_kl_mean
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
@@ -579,41 +471,9 @@ def ppo_update(
 
             policy_loss_sum += policy_loss.item()
             value_loss_sum += value_loss.item()
-            entropy_sum += entropy_bonus.item()
+            entropy_sum += entropy_mean.item()
             gate_kl_sum += gate_kl_mean.item()
             num_minibatches += 1
-
-        # once per epoch: self-imitation step on the anchor buffer
-        anchor_batch = anchor_buffer.sample(ANCHOR_MINIBATCH_SIZE) if len(anchor_buffer) >= ANCHOR_MIN_FILL else None
-        if anchor_batch is not None:
-            a_scalar = torch.from_numpy(anchor_batch["scalar"]).to(DEVICE)
-            a_spatial = reconstruct_spatial_torch(
-                torch.from_numpy(anchor_batch["agent_id"]).to(DEVICE).long(),
-                torch.from_numpy(anchor_batch["owner_grid"]).to(DEVICE).long(),
-                torch.from_numpy(anchor_batch["ratio_table"]).to(DEVICE).float(),
-                a_scalar[:, 1], static_planes,
-            )
-            a_return = torch.from_numpy(anchor_batch["ret"]).to(DEVICE)
-            _, a_log_prob, _, a_value = agent.get_action_and_value(
-                spatial=a_spatial, scalar=a_scalar,
-                entities=torch.from_numpy(anchor_batch["entities"]).to(DEVICE),
-                entity_mask=torch.from_numpy(anchor_batch["entity_mask"]).to(DEVICE),
-                action=torch.from_numpy(anchor_batch["action"]).to(DEVICE),
-            )
-            a_value = a_value.squeeze(-1)
-            with torch.no_grad():
-                weight = torch.clamp((a_return - a_value) / return_std, min=0.0)
-            policy_term = -(weight * a_log_prob).mean()
-            # only pushes the value up toward a demonstrated return, never down
-            value_term = 0.5 * torch.clamp((a_return - a_value) / return_std, min=0.0).square().mean()
-            anchor_loss = ANCHOR_COEF * (policy_term + VALUE_COEF * value_term)
-
-            optimizer.zero_grad()
-            anchor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
-            optimizer.step()
-            anchor_loss_sum += anchor_loss.item()
-            anchor_steps += 1
 
         low_ratio_batch = low_ratio_buffer.sample(LOW_RATIO_MINIBATCH_SIZE) if len(low_ratio_buffer) >= LOW_RATIO_MIN_FILL else None
         if low_ratio_batch is not None:
@@ -639,9 +499,6 @@ def ppo_update(
             low_ratio_loss_sum += low_ratio_loss.item()
             low_ratio_steps += 1
 
-    params_after = torch.cat([p.detach().flatten() for p in agent.parameters()])
-    weight_delta_l2 = (params_after - params_before).norm().item()
-
     ppo_elapsed = time.perf_counter() - ppo_start
     total_train_hours += (rollout_elapsed + ppo_elapsed) / 3600
     num_minibatches = max(num_minibatches, 1)
@@ -652,21 +509,10 @@ def ppo_update(
         f"episodes_finished={rollout.episodes_finished} wins={rollout.episode_wins} "
         f"[{setups}] "
         f"ends({_ends_str(rollout.end_records)}) "
-        f"nation_structs_win({_structs_str(rollout.end_structs_win)}) nation_structs_loss({_structs_str(rollout.end_structs_loss)}) "
-        f"mean_gold_at_win={_mean(rollout.episode_end_golds_win):,.0f} mean_gold_at_loss={_mean(rollout.episode_end_golds_loss):,.0f} "
         f"policy_loss={policy_loss_sum / num_minibatches:.4f} "
-        f"bc_loss={bc_loss_sum / num_minibatches:.4f} "
         f"value_loss={value_loss_sum / num_minibatches:.4f} "
         f"entropy={entropy_sum / num_minibatches:.4f} gate_kl={gate_kl_sum / num_minibatches:.4f} "
-        f"approx_kl={approx_kl:.4f} frac_low_ratio={frac_low_ratio:.4f} "
-        f"value_err_low_ratio={low_ratio_err_sum / max(low_ratio_err_count, 1):.4f}(n={low_ratio_err_count}) "
-        f"value_err_normal={normal_err_sum / max(normal_err_count, 1):.4f}(n={normal_err_count}) "
-        f"anchor_buffer_size={len(anchor_buffer)} anchor_inserted={anchor_inserted} "
-        f"anchor_loss={anchor_loss_sum / max(anchor_steps, 1):.4f} "
-        f"low_ratio_buffer_size={len(low_ratio_buffer)} low_ratio_inserted={low_ratio_inserted} "
-        f"low_ratio_loss={low_ratio_loss_sum / max(low_ratio_steps, 1):.4f} "
-        f"raw_adv_mean={raw_advantage_mean:.4f} raw_adv_std={raw_advantage_std:.4f} "
-        f"weight_delta_l2={weight_delta_l2:.4f} "
+        f"approx_kl={approx_kl:.4f} "
         f"time={rollout_elapsed + ppo_elapsed:.1f}s (rollout={rollout_elapsed:.1f}s ppo={ppo_elapsed:.1f}s) "
         f"ticks/sec={total / rollout_elapsed:.1f} total_train_hours={total_train_hours:.2f}"
     )
@@ -695,7 +541,7 @@ def train():
         optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
         warmup_from_update = None  # set when the optimizer starts without saved state
         if checkpoint is not None:
-            load_padded(agent, checkpoint["model"])
+            agent.load_state_dict(checkpoint["model"])
             try:
                 optimizer.load_state_dict(checkpoint["optimizer"])
                 if any(s["exp_avg"].shape != p.shape for p, s in ((p, optimizer.state[p]) for p in agent.parameters()) if s):
@@ -708,7 +554,6 @@ def train():
         else:
             warmup_from_update = 0
 
-        anchor_buffer = AnchorBuffer(ANCHOR_BUFFER_CAPACITY)
         low_ratio_buffer = AnchorBuffer(LOW_RATIO_BUFFER_CAPACITY)
 
         print(f"training on device={DEVICE}, num_envs={NUM_ENVS}, nations={NATIONS}, difficulty={DIFFICULTIES}")
@@ -726,7 +571,7 @@ def train():
 
             total_train_hours = ppo_update(
                 rollout, agent, optimizer, update, total_train_hours,
-                return_stats, anchor_buffer, low_ratio_buffer,
+                return_stats, low_ratio_buffer,
             )
             save_total_train_hours(total_train_hours)
             del rollout  # frees the buffers before the next rollout allocates its own

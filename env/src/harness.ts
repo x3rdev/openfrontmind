@@ -42,9 +42,6 @@ const AUTO_CITY_MAX = 3;
 const AUTO_CITY_COOLDOWN_TICKS = 30;
 const AUTO_CITY_GRID_STRIDE = 8;
 
-// Construction deducts gold a tick after the intent, so builds must not be issued back to back.
-const BUILD_GAP_TICKS = 5;
-
 // Loads a vendored test map by folder name (tests/testdata/maps/).
 async function loadTestMap(name: string) {
   const dir = path.join(PROJECT_ROOT, name);
@@ -82,8 +79,6 @@ export interface HarnessSession {
   state: HarnessState;
   agentClientID: string;
   lastCityTick: number;
-  lastBuildTick: number;
-  builtCounts: Record<string, number>;
 }
 
 export async function reset(
@@ -192,7 +187,7 @@ export async function reset(
   state.packedTileUpdates = combined;
   state.unitUpdates = spawnUnitUpdates;
 
-  return { runner, game, state, agentClientID, lastCityTick: -Infinity, lastBuildTick: -Infinity, builtCounts: {} };
+  return { runner, game, state, agentClientID, lastCityTick: -Infinity };
 }
 
 export interface AttackTarget {
@@ -275,7 +270,6 @@ function computeAttackMask(
 // Builds a city at the buildable site nearest the centroid of the agent's territory.
 function autoCityIntent(session: HarnessSession): StampedIntent | null {
   const { game } = session;
-  if (game.ticks() - session.lastBuildTick < BUILD_GAP_TICKS) return null;
   const agent = game.playerByClientID(session.agentClientID);
   if (agent === null || !agent.isAlive()) return null;
   if (game.ticks() - session.lastCityTick < AUTO_CITY_COOLDOWN_TICKS) return null;
@@ -296,7 +290,7 @@ function autoCityIntent(session: HarnessSession): StampedIntent | null {
   for (const [x, y] of owned.slice(0, 20)) {
     const site = agent.canBuild(UnitType.City, map.ref(x, y));
     if (site !== false) {
-      session.lastCityTick = session.lastBuildTick = game.ticks();
+      session.lastCityTick = game.ticks();
       return { type: "build_unit", unit: UnitType.City, tile: site, clientID: session.agentClientID } as unknown as StampedIntent;
     }
   }
@@ -338,14 +332,6 @@ export function step(
   state.packedTileUpdates = concat(Uint32Array, tiles);
   state.packedPlayerUpdates = concat(Float64Array, players);
   state.unitUpdates = unitUpdates;
-  const agentNow = game.playerByClientID(session.agentClientID);
-  if (agentNow !== null) {
-    for (const t of [UnitType.City]) {
-      const n = agentNow.unitCount(t);
-      if (n > (session.builtCounts[t] ?? 0)) console.log(`[built] ${t} #${n} tick=${game.ticks()}`);
-      session.builtCounts[t] = n;
-    }
-  }
   const winner = game.getWinner();
   const { attackMask, outgoingTroops, incomingTroops } = computeAttackMask(game, session.agentClientID);
   return {
