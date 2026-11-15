@@ -74,6 +74,8 @@ export interface HarnessState {
   packedPlayerUpdates?: Float64Array;
   unitUpdates?: UnitUpdate[];
   alliances: { tick: number; a: number; b: number }[];
+  conquests: { tick: number; conqueror: number; conquered: number; type: string }[];
+  enclosures: { tick: number; capturing: number; victim: number; victimType: string; tiles: number }[];
 }
 
 export interface HarnessSession {
@@ -168,6 +170,14 @@ export async function reset(
     turnNumber: 0,
     fatalError: undefined,
     alliances: [],
+    conquests: [],
+    enclosures: [],
+  };
+  (game as unknown as { ofmEnclosures: object[] }).ofmEnclosures = state.enclosures;
+  const conquerPlayer = game.conquerPlayer.bind(game);
+  game.conquerPlayer = (conqueror, conquered) => {
+    state.conquests.push({ tick: game.ticks(), conqueror: conqueror.smallID(), conquered: conquered.smallID(), type: conquered.type() });
+    conquerPlayer(conqueror, conquered);
   };
   // Collects every update from the spawn phase so reset() returns the full state.
   const spawnTileUpdates: Uint32Array[] = [];
@@ -225,6 +235,15 @@ export interface AttackTarget {
   attackingMeTroops: number;
   // troops the agent currently has committed in active attacks on this target.
   outgoingTroops: number;
+  // attackable now: bordering and not allied or immune.
+  canAttack: boolean;
+  canRequest: boolean;
+  allied: boolean;
+  // this player has a pending alliance request to the agent.
+  requestedMe: boolean;
+  traitorTicks: number;
+  betrayals: number;
+  allies: number[];
 }
 
 export interface StepResult {
@@ -271,23 +290,31 @@ function computeAttackMask(
     incomingByAttacker.set(attackerID, (incomingByAttacker.get(attackerID) ?? 0) + a.troops());
   }
 
-  const attackMask = agent.nearby().map((p) =>
-    p.isPlayer()
-      ? {
-          targetID: p.id(),
-          smallID: p.smallID(),
-          alreadyAttacking: activeTargets.has(p.id()),
-          attackingMeTroops: incomingByAttacker.get(p.id()) ?? 0,
-          outgoingTroops: outgoingByTarget.get(p.id()) ?? 0,
-        }
-      : {
-          targetID: null,
-          smallID: null,
-          alreadyAttacking: activeTargets.has(WILDERNESS_KEY),
-          attackingMeTroops: 0,
-          outgoingTroops: outgoingByTarget.get(WILDERNESS_KEY) ?? 0,
-        },
-  );
+  const neighbours = new Set(agent.nearby());
+  const wild = {
+    targetID: null, smallID: null, alreadyAttacking: activeTargets.has(WILDERNESS_KEY), attackingMeTroops: 0,
+    outgoingTroops: outgoingByTarget.get(WILDERNESS_KEY) ?? 0, canAttack: true, canRequest: false, allied: false,
+    requestedMe: false, traitorTicks: 0, betrayals: 0, allies: [] as number[],
+  };
+  const attackMask: AttackTarget[] = [];
+  for (const n of neighbours) if (!n.isPlayer()) attackMask.push(wild);
+  for (const p of game.players()) {
+    if (p === agent || !p.isAlive()) continue;
+    attackMask.push({
+      targetID: p.id(),
+      smallID: p.smallID(),
+      alreadyAttacking: activeTargets.has(p.id()),
+      attackingMeTroops: incomingByAttacker.get(p.id()) ?? 0,
+      outgoingTroops: outgoingByTarget.get(p.id()) ?? 0,
+      canAttack: neighbours.has(p) && agent.canAttackPlayer(p),
+      canRequest: agent.canSendAllianceRequest(p),
+      allied: agent.isAlliedWith(p),
+      requestedMe: p.outgoingAllianceRequests().some((r) => r.recipient() === agent),
+      traitorTicks: p.getTraitorRemainingTicks(),
+      betrayals: p.betrayals(),
+      allies: p.allies().map((a) => a.smallID()),
+    });
+  }
 
   return { attackMask, outgoingTroops, incomingTroops };
 }

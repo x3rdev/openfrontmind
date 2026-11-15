@@ -13,6 +13,52 @@ ABLATE = set(os.environ.get("OFM_ABLATE", "").split(","))  # temporary test swit
 RESERVE_FLOOR = float(os.environ.get("OFM_RESERVE_FLOOR", "0.2"))
 CONV_OUT_CHANNELS = 32
 POOL_SIZE = 16
+ACTION_STRIDE = 64  # action float = attack_row + size_fraction + ACTION_STRIDE * (diplomacy_code + 1)
+CAN_ATTACK, CAN_REQUEST, ALLIED, REQUESTED_ME = 15, 16, 17, 18  # entity feature columns
+DIPLOMACY_PRIOR = 0.02  # reference act rate of the diplomacy gate
+DIPLOMACY_PRIOR_PENDING = 0.3  # ... when someone has a request pending to us
+
+
+def decode_action(action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns (attack_row, size_fraction, diplomacy_code); diplomacy_code is -1 for none,
+    r for a request to row r, N + r for breaking the alliance with row r (N = slot count)."""
+    whole = torch.floor(action).long()
+    return whole % ACTION_STRIDE, (action - whole.to(action.dtype)).float(), whole // ACTION_STRIDE - 1
+
+
+def load_padded(agent: nn.Module, state: dict) -> None:
+    """Loads a checkpoint into an agent whose layers may have grown; new weights start at zero."""
+    new_state = agent.state_dict()
+    for key, old in state.items():
+        if key not in new_state:
+            continue
+        if old.shape == new_state[key].shape:
+            new_state[key] = old
+        elif old.dim() == new_state[key].dim() and all(n >= o for n, o in zip(new_state[key].shape, old.shape)):
+            grown = torch.zeros_like(new_state[key])
+            grown[tuple(slice(0, o) for o in old.shape)] = old
+            new_state[key] = grown
+    agent.load_state_dict(new_state)
+
+
+def drop_gold_inputs(state: dict) -> dict:
+    """Converts a pre-removal checkpoint: deletes the gold column from every layer that read it."""
+    pooled = CONV_OUT_CHANNELS * POOL_SIZE * POOL_SIZE
+    columns = {
+        "backbone.entity_encoder.mlp.0.weight": 5,
+        "backbone.merge_mlp.0.weight": pooled,
+        "value_head.0.weight": 256,
+        "gate_head.weight": 256,
+        "diplomacy_gate.weight": 256,
+        "size_head.weight": 256,
+    }
+    state = dict(state)
+    for key, col in columns.items():
+        if key not in state:
+            continue
+        w = state[key]
+        state[key] = torch.cat([w[:, :col], w[:, col + 1:]], dim=1)
+    return state
 
 
 class EntityEncoder(nn.Module):
@@ -82,6 +128,12 @@ class Agent(nn.Module):
         )
         self.query_proj = nn.Linear(256, entity_embed_dim)
         self.gate_head = nn.Linear(256 + scalar_dim, 2)  # logits: [wait, act]
+        self.diplomacy_query = nn.Linear(256, 2 * entity_embed_dim)  # request and break pointers
+        self.diplomacy_gate = nn.Linear(256 + scalar_dim, 2)
+        nn.init.zeros_(self.diplomacy_gate.weight)
+        self.break_bias = nn.Parameter(torch.tensor(-2.0))  # breaking starts as a rare choice
+        with torch.no_grad():
+            self.diplomacy_gate.bias.copy_(torch.log(torch.tensor([1 - DIPLOMACY_PRIOR, DIPLOMACY_PRIOR])))
         self.register_buffer("size_bins", torch.tensor(SIZE_BINS), persistent=False)
         self.size_head = nn.Linear(256 + scalar_dim + entity_embed_dim, len(SIZE_BINS))
         nn.init.zeros_(self.size_head.weight)
@@ -111,10 +163,10 @@ class Agent(nn.Module):
         """Samples an action when `action` is None, otherwise scores the given one.
         Returns (action, log_prob, entropy, value)."""
         hidden, entity_embeds = self.backbone(spatial, scalar, entities, entity_mask)
-        troop_ratio = scalar[:, 1]
+        troop_ratio = scalar[:, 0]
 
         is_do_nothing = entities[..., 3] > 0.5
-        real_target_mask = entity_mask & ~is_do_nothing
+        real_target_mask = entity_mask & ~is_do_nothing & (entities[..., CAN_ATTACK] > 0.5)
         can_act = real_target_mask.any(dim=-1) & (troop_ratio >= self.reserve_floor)
         do_nothing_idx = is_do_nothing.float().argmax(dim=-1)
 
@@ -132,6 +184,25 @@ class Agent(nn.Module):
         ref_logp = torch.log(torch.stack([1 - ref_act, ref_act], dim=-1))
         self.gate_kl = (gate_dist.probs * (gate_dist.logits - ref_logp)).sum(dim=-1)
 
+        gate_input = torch.cat([hidden, scalar], dim=-1)
+        can_request = entity_mask & (entities[..., CAN_REQUEST] > 0.5)
+        can_break = entity_mask & (entities[..., ALLIED] > 0.5)
+        request_query, break_query = self.diplomacy_query(hidden).chunk(2, dim=-1)
+        scale = self.entity_embed_dim ** 0.5
+        diplomacy_scores = torch.cat([
+            torch.einsum("bnd,bd->bn", entity_embeds, request_query) / scale,
+            torch.einsum("bnd,bd->bn", entity_embeds, break_query) / scale + self.break_bias,
+        ], dim=-1).masked_fill(~torch.cat([can_request, can_break], dim=-1), -1e8)
+        diplomacy_dist = Categorical(logits=diplomacy_scores)
+        can_diplomacy = can_request.any(dim=-1) | can_break.any(dim=-1)
+        diplomacy_gate_logits = self.diplomacy_gate(gate_input)
+        diplomacy_act_logit = torch.where(can_diplomacy, diplomacy_gate_logits[:, 1], torch.full_like(gate_logits[:, 1], -1e8))
+        diplomacy_gate = Categorical(logits=torch.stack([diplomacy_gate_logits[:, 0], diplomacy_act_logit], dim=-1))
+        pending = (can_request & (entities[..., REQUESTED_ME] > 0.5)).any(dim=-1)
+        prior = torch.where(pending, torch.full_like(troop_ratio, DIPLOMACY_PRIOR_PENDING), torch.full_like(troop_ratio, DIPLOMACY_PRIOR))
+        diplomacy_ref = torch.log(torch.stack([1 - prior, prior], dim=-1))
+        self.gate_kl = self.gate_kl + (diplomacy_gate.probs * (diplomacy_gate.logits - diplomacy_ref)).sum(dim=-1)
+
         action_was_sampled = action is None
         if action is None:
             gate_action = gate_dist.sample()
@@ -140,11 +211,11 @@ class Agent(nn.Module):
             size_dist = self._size_dist(hidden, scalar, entity_embeds, action)
             size_action = self.size_bins[size_dist.sample()]
             size_action = torch.where(action == do_nothing_idx, torch.full_like(size_action, 0.5), size_action)
-            action_out = action.double() + size_action.double()
+            diplomacy_code = torch.where(diplomacy_gate.sample() == 1, diplomacy_dist.sample(), torch.full_like(action, -1))
+            action_out = action.double() + size_action.double() + ACTION_STRIDE * (diplomacy_code.double() + 1)
         else:
             action_out = action
-            target_idx = torch.floor(action).long()
-            size_frac = (action - target_idx.to(action.dtype)).float()
+            target_idx, size_frac, diplomacy_code = decode_action(action)
             size_action = (size_frac.unsqueeze(-1) - self.size_bins).abs().argmin(dim=-1)
             action = target_idx
             size_dist = self._size_dist(hidden, scalar, entity_embeds, action)
@@ -152,9 +223,10 @@ class Agent(nn.Module):
         if action_was_sampled:
             size_action = (size_action.unsqueeze(-1) - self.size_bins).abs().argmin(dim=-1)
         acted = (action != do_nothing_idx).long()
+        diplomacy_acted = (diplomacy_code >= 0).long()
         log_prob = gate_dist.log_prob(acted) + acted.float() * (
             target_dist.log_prob(action) + size_dist.log_prob(size_action)
-        )
+        ) + diplomacy_gate.log_prob(diplomacy_acted) + diplomacy_acted.float() * diplomacy_dist.log_prob(diplomacy_code.clamp(min=0))
 
         # gate entropy is left out; the gate is regularised through gate_kl instead
         num_candidates = real_target_mask.sum(dim=-1).float()

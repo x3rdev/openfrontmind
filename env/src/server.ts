@@ -141,6 +141,8 @@ async function handle(cmd: Record<string, unknown>): Promise<void> {
       incomingTroops: result.incomingTroops,
       unitUpdates: result.unitUpdates,
       alliances: session.state.alliances,
+      conquests: session.state.conquests,
+      enclosures: session.state.enclosures,
       maxTroops: maxTroopsBySmallID(session),
       totalLand: totalLand(session),
     });

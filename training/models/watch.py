@@ -9,28 +9,22 @@ from training.envs.bridge import OpenFrontBridge
 from training.envs.game_state import EpisodeState, new_masks, apply_reset, apply_step, apply_unit_updates
 from training.envs.map_view import draw_troop_counts, draw_units, outline_agent_territory, render
 from training.envs.observation import encode_observation
-from training.envs.action_space import build_entities, pad_entities, action_to_intents, DO_NOTHING
-from training.envs.running_stats import RunningMeanStd
-from training.models.policy import Agent
-from training.models.train import latest_checkpoint, NATIONS, DIFFICULTY
+from training.envs.action_space import build_entities, pad_entities, action_to_intents, diplomacy_from_code, DO_NOTHING
+from training.models.policy import Agent, decode_action, drop_gold_inputs, load_padded
+from training.models.train import latest_checkpoint, BOTS, NATIONS, DIFFICULTY
 
 
 def main(
     checkpoint_path: str | Path, seed: str, scale: int, headless: bool = False, diagnostic: bool = False,
-    nations: int = NATIONS, difficulty: str = DIFFICULTY,
-    max_ticks: int | None = None, map_name: str = "mid_plains",
+    bots: int = BOTS, nations: int = NATIONS, difficulty: str = DIFFICULTY,
+    max_ticks: int | None = None, map_name: str = "mid_plains", render_every: int = 10,
 ) -> dict | None:
     print(f"using checkpoint: {checkpoint_path}")
     torch.manual_seed(zlib.crc32(seed.encode()))  # actions are sampled from the torch RNG
     checkpoint = torch.load(checkpoint_path)
-    # normalization stays frozen at what the weights were trained with
-    gold_stats = RunningMeanStd()
-    gold_stats.mean = checkpoint["gold_mean"]
-    gold_stats.var = checkpoint["gold_var"]
-    gold_stats.count = checkpoint["gold_count"]
 
     with OpenFrontBridge() as bridge:
-        setup = bridge.reset(seed=seed, map=map_name, bots=0, nations=nations, difficulty=difficulty)
+        setup = bridge.reset(seed=seed, map=map_name, bots=bots, nations=nations, difficulty=difficulty)
         width, height = setup["width"], setup["height"]
 
         owner_grid, land_mask, impassable_mask, is_mine, is_enemy = new_masks(width, height)
@@ -43,8 +37,6 @@ def main(
         total_land = setup["totalLand"]
         spatial, scalar, ratio_table = encode_observation(land_mask, impassable_mask, is_mine, is_enemy, player_stats, agent_small_id, total_land, owner_grid)
         entity_features, targets = build_entities([], player_stats, player_types, total_land)
-        scalar[0] = gold_stats.normalize(scalar[0])
-        entity_features[:, 5] = gold_stats.normalize(entity_features[:, 5])
         entities, entity_mask = pad_entities(entity_features)
 
         episode = EpisodeState(
@@ -57,19 +49,30 @@ def main(
         )
 
         agent = Agent.from_observation(spatial, scalar, entities)
-        agent.load_state_dict(checkpoint["model"])
+        load_padded(agent, drop_gold_inputs(checkpoint["model"]) if "gold_mean" in checkpoint else checkpoint["model"])
         agent.eval()
 
         if not headless:
             import cv2
 
-            cv2.namedWindow("map")
-            img = render(episode.owner_grid, episode.land_mask, episode.agent_small_id, episode.player_types).to_bgr_uint8(scale=scale)
-            draw_units(img, units, width, scale)
-            draw_troop_counts(img, episode.owner_grid, episode.land_mask, episode.player_stats, episode.agent_small_id, scale)
-            cv2.imshow("map", outline_agent_territory(img, episode.owner_grid, episode.agent_small_id, scale))
+            cv2.namedWindow("map", cv2.WINDOW_NORMAL)
+            # big maps are drawn on a strided grid so a frame stays cheap
+            stride = max(1, -(-max(width, episode.height) // 1000))
+            draw_scale = scale if stride == 1 else 1
+
+            def show():
+                owners, land = episode.owner_grid[::stride, ::stride], episode.land_mask[::stride, ::stride]
+                img = render(owners, land, episode.agent_small_id, episode.player_types).to_bgr_uint8(scale=draw_scale)
+                draw_units(img, units, width, draw_scale / stride)
+                draw_troop_counts(img, owners, land, episode.player_stats, episode.agent_small_id, draw_scale)
+                cv2.imshow("map", outline_agent_territory(img, owners, episode.agent_small_id, draw_scale))
+
+            show()
+            cv2.resizeWindow("map", 900, 900)
+            cv2.moveWindow("map", 300, 60)
             cv2.waitKey(1)
 
+        diplomacy_counts = {"request": 0, "break": 0}
         do_nothing_ticks = 0
         attack_ticks = 0
         attack_troop_ratios = []
@@ -87,12 +90,15 @@ def main(
                     entity_mask=torch.from_numpy(entity_mask).unsqueeze(0),
                     action=None,
                 )[0]
-            action_idx = int(np.floor(action.item()))
-            size_frac = action.item() - action_idx
+            attack_row, size_frac, diplomacy_code = decode_action(action.reshape(1).double())
+            action_idx, size_frac, diplomacy_code = int(attack_row[0]), float(size_frac[0]), int(diplomacy_code[0])
+            diplomacy = diplomacy_from_code(diplomacy_code, targets)
+            if diplomacy is not None:
+                diplomacy_counts[diplomacy[0]] += 1
             target = targets[action_idx] if action_idx < len(targets) else DO_NOTHING
 
-            troop_ratio_now = float(scalar[1])
-            tile_fraction_now = float(scalar[2])
+            troop_ratio_now = float(scalar[0])
+            tile_fraction_now = float(scalar[1])
 
             if diagnostic:
                 if target is DO_NOTHING:
@@ -108,7 +114,7 @@ def main(
                     peak_tick = i
 
             troops = size_frac * episode.player_stats.get(episode.agent_small_id, {}).get("troops", 0.0)
-            intents = action_to_intents(target=target, agent_client_id=episode.agent_client_id, troops=troops)
+            intents = action_to_intents(target=target, agent_client_id=episode.agent_client_id, troops=troops, diplomacy=diplomacy)
             step_result = bridge.step(intents)
 
             entity_features, _prev_stats, curr_stats, done, _won = apply_step(episode, step_result)
@@ -116,16 +122,11 @@ def main(
             apply_unit_updates(units, step_result["unitUpdates"])
             eliminated = curr_stats.get("tilesOwned", 0.0) == 0.0
 
-            scalar[0] = gold_stats.normalize(scalar[0])
-            entity_features[:, 5] = gold_stats.normalize(entity_features[:, 5])
             episode.entities, episode.entity_mask = pad_entities(entity_features)
             entities, entity_mask = episode.entities, episode.entity_mask
 
-            if not headless and i % 10 == 0:
-                img = render(episode.owner_grid, episode.land_mask, episode.agent_small_id, episode.player_types).to_bgr_uint8(scale=scale)
-                draw_units(img, units, width, scale)
-                draw_troop_counts(img, episode.owner_grid, episode.land_mask, episode.player_stats, episode.agent_small_id, scale)
-                cv2.imshow("map", outline_agent_territory(img, episode.owner_grid, episode.agent_small_id, scale))
+            if not headless and i % render_every == 0:
+                show()
                 if cv2.waitKey(1) & 0xFF == ord("q"):  # waitKey also repaints the window
                     break
 
@@ -162,6 +163,11 @@ def main(
             alliances = step_result.get("alliances", [])
             agent_alliances = sum(episode.agent_small_id in (a["a"], a["b"]) for a in alliances)
             nation_alliances = len(alliances) - agent_alliances
+            eliminations = sum(c["conqueror"] == episode.agent_small_id and c["type"] == "NATION" for c in step_result.get("conquests", []))
+            enclosures = step_result.get("enclosures", [])
+            encl_gained = sum(e["tiles"] for e in enclosures if e["capturing"] == episode.agent_small_id)
+            encl_lost = sum(e["tiles"] for e in enclosures if e["victim"] == episode.agent_small_id)
+            encl_events = sum(e["capturing"] == episode.agent_small_id for e in enclosures)
             first_alliance = min((a["tick"] for a in alliances), default=None)
             print(
                 f"[diagnostic] seed={seed} winner={step_result['winner']} won={summary['won']} "
@@ -171,7 +177,7 @@ def main(
                 f"mean_attack_troop_ratio="
                 f"{mean_attack_troop_ratio if mean_attack_troop_ratio is None else f'{mean_attack_troop_ratio:.3f}'} "
                 f"peak_tile_fraction={peak_tile_fraction:.3f}@{peak_tick} "
-                f"alliances_nation_nation={nation_alliances} alliances_with_agent={agent_alliances} first_alliance_tick={first_alliance}"
+                f"requests_sent={diplomacy_counts['request']} breaks_sent={diplomacy_counts['break']} alliances_nation_nation={nation_alliances} alliances_with_agent={agent_alliances} first_alliance_tick={first_alliance} eliminations={eliminations} enclosure_events={encl_events} enclosure_tiles_gained={encl_gained} enclosure_tiles_lost={encl_lost} enclosures_all={len(enclosures)}"
             )
             return summary
 
@@ -183,8 +189,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", default=None, help="defaults to the most recent checkpoint")
     parser.add_argument("--seed", default="seedseed", help="comma-separated for multiple runs")
     parser.add_argument("--scale", type=int, default=2)
+    parser.add_argument("--render-every", type=int, default=10, help="redraw the map every N decisions")
     parser.add_argument("--headless", action="store_true", help="skip the cv2 window")
     parser.add_argument("--diagnostic", action="store_true", help="print per-game action stats and, over several seeds, an aggregate")
+    parser.add_argument("--bots", type=int, default=BOTS)
     parser.add_argument("--nations", type=int, default=NATIONS)
     parser.add_argument("--difficulty", default=DIFFICULTY)
     parser.add_argument("--max-ticks", type=int, default=None, help="stop early after N ticks")
@@ -201,8 +209,8 @@ if __name__ == "__main__":
         summaries.append(main(
             checkpoint_path=checkpoint_path, seed=seed, scale=args.scale,
             headless=args.headless, diagnostic=args.diagnostic,
-            nations=args.nations, difficulty=args.difficulty,
-            max_ticks=args.max_ticks, map_name=args.map_name,
+            bots=args.bots, nations=args.nations, difficulty=args.difficulty,
+            max_ticks=args.max_ticks, map_name=args.map_name, render_every=args.render_every,
         ))
 
     if args.diagnostic and len(seeds) > 1:

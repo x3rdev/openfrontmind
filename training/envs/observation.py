@@ -56,7 +56,7 @@ def encode_observation(
 
     Returns (spatial, scalar, ratio_table):
       spatial: (6, H, W) planes [is_land, is_impassable, is_mine, is_enemy, troop_ratio, troop_advantage]
-      scalar: (5,) agent features [log gold, troop_ratio, tile fraction, outgoing_ratio, incoming_ratio]
+      scalar: (4,) agent features [troop_ratio, tile fraction, outgoing_ratio, incoming_ratio]
       ratio_table: see build_ratio_table
     outgoing/incoming_troops are the agent's committed attack troops and the enemy troops attacking it.
     """
@@ -77,7 +77,6 @@ def encode_observation(
     outgoing_ratio = outgoing_troops / max_troops
     incoming_ratio = incoming_troops / max_troops
     scalar = np.array([
-        np.log1p(agent_stats.get("gold", 0.0)),
         troop_ratio,
         tiles_fraction,
         outgoing_ratio,

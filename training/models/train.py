@@ -11,10 +11,10 @@ import torch.optim
 from training.envs.vec_bridge import VecOpenFrontBridge
 from training.envs.game_state import EpisodeState, new_masks, apply_reset, apply_step
 from training.envs.observation import encode_observation, reconstruct_spatial_torch, MAX_SMALL_ID
-from training.envs.action_space import build_entities, pad_entities, action_to_intents, DO_NOTHING
+from training.envs.action_space import build_entities, pad_entities, action_to_intents, diplomacy_from_code, DO_NOTHING, MAX_ENTITIES
 from training.envs.reward import compute_reward
 from training.envs.running_stats import RunningMeanStd
-from training.models.policy import Agent
+from training.models.policy import Agent, decode_action, drop_gold_inputs, load_padded
 
 # Rollout length per env. Games continue across updates; NUM_ENVS is bounded by RAM (the
 # buffers store every tick).
@@ -25,6 +25,7 @@ MAX_EPISODE_TICKS = 30000  # episodes still running here end; the highest tile s
 CAP_FLAG_FRAC = 0.05  # warn when more than this share of an update's episodes hit the cap
 
 NATIONS = int(os.environ.get("OFM_NATIONS", "5"))
+BOTS = int(os.environ.get("OFM_BOTS", "0"))  # Tribes
 # One difficulty is drawn per episode; repeat a name to weight it, e.g. "Medium,Medium,Hard".
 DIFFICULTIES = os.environ.get("OFM_DIFFICULTY", "Easy").split(",")
 DIFFICULTY = DIFFICULTIES[0]
@@ -65,7 +66,7 @@ def save_total_train_hours(total_train_hours: float) -> None:
 
 
 def save_checkpoint(
-    agent, update: int, gold_stats: RunningMeanStd, return_stats: RunningMeanStd, total_train_hours: float,
+    agent, update: int, return_stats: RunningMeanStd, total_train_hours: float,
     optimizer: torch.optim.Optimizer,
 ) -> Path:
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -73,9 +74,6 @@ def save_checkpoint(
     torch.save(
         {
             "model": agent.state_dict(),
-            "gold_mean": gold_stats.mean,
-            "gold_var": gold_stats.var,
-            "gold_count": gold_stats.count,
             "return_mean": return_stats.mean,
             "return_var": return_stats.var,
             "return_count": return_stats.count,
@@ -122,18 +120,7 @@ class Rollout:
     elapsed: float
 
 
-def _apply_gold_stats(scalar: np.ndarray, entity_features: np.ndarray, gold_stats: RunningMeanStd) -> None:
-    """Update running gold stats from real entities only, then normalize in place."""
-    is_real = (entity_features[:, 0] == 1.0) | (entity_features[:, 1] == 1.0)  # tribe or nation
-    real_gold = entity_features[is_real, 5]
-    own_gold = scalar[0:1]
-    gold_stats.update(np.concatenate([own_gold, real_gold]) if real_gold.size else own_gold)
-
-    scalar[0] = gold_stats.normalize(scalar[0])
-    entity_features[:, 5] = gold_stats.normalize(entity_features[:, 5])
-
-
-def _episode_state_from_setup(setup: dict, gold_stats: RunningMeanStd) -> EpisodeState:
+def _episode_state_from_setup(setup: dict) -> EpisodeState:
     width, height = setup["width"], setup["height"]
     owner_grid, land_mask, impassable_mask, is_mine, is_enemy = new_masks(width, height)
     player_stats, agent_small_id, player_types = apply_reset(
@@ -143,7 +130,6 @@ def _episode_state_from_setup(setup: dict, gold_stats: RunningMeanStd) -> Episod
     total_land = setup["totalLand"]
     spatial, scalar, ratio_table = encode_observation(land_mask, impassable_mask, is_mine, is_enemy, player_stats, agent_small_id, total_land, owner_grid)
     entity_features, targets = build_entities([], player_stats, player_types, total_land)
-    _apply_gold_stats(scalar, entity_features, gold_stats)
     entities, entity_mask = pad_entities(entity_features)
 
     return EpisodeState(
@@ -168,23 +154,24 @@ def _episode_state_from_setup(setup: dict, gold_stats: RunningMeanStd) -> Episod
     )
 
 
-def start_episode(bridge, gold_stats: RunningMeanStd) -> EpisodeState:
+def start_episode(bridge) -> EpisodeState:
     difficulty = random.choice(DIFFICULTIES)
     seed = str(random.randint(0, 2 ** 31 - 1))
     setup = bridge.reset(
         seed=seed,
         map="mid_plains",
+        bots=BOTS,
         nations=NATIONS,
         difficulty=difficulty,
     )
-    episode = _episode_state_from_setup(setup, gold_stats)
+    episode = _episode_state_from_setup(setup)
     episode.difficulty = difficulty
     episode.seed = seed
     return episode
 
 
-def start_all_episodes(vec_bridge: VecOpenFrontBridge, gold_stats: RunningMeanStd) -> list[EpisodeState]:
-    return list(vec_bridge.executor.map(lambda b: start_episode(b, gold_stats), vec_bridge.bridges))
+def start_all_episodes(vec_bridge: VecOpenFrontBridge) -> list[EpisodeState]:
+    return list(vec_bridge.executor.map(start_episode, vec_bridge.bridges))
 
 
 def compute_value_for_episodes(agent, episodes: list[EpisodeState]) -> torch.Tensor:
@@ -202,7 +189,6 @@ def collect_rollout(
     vec_bridge: VecOpenFrontBridge,
     agent,
     episodes: list[EpisodeState],
-    gold_stats: RunningMeanStd,
 ) -> tuple[list[EpisodeState], Rollout]:
     rollout_start = time.perf_counter()
 
@@ -243,14 +229,14 @@ def collect_rollout(
         log_probs_np = log_prob.cpu().numpy()
         values_np = value.squeeze(-1).cpu().numpy()
 
-        # action = target index + attack size as a fraction of current troops
-        tgt_idx = np.floor(actions_np).astype(np.int64)
-        size_frac = actions_np - tgt_idx
+        # action = attack row + attack size as a fraction of troops + a diplomacy code, see decode_action
+        tgt_idx, size_frac, diplomacy_code = (t.numpy() for t in decode_action(torch.from_numpy(actions_np)))
         intents_list = [
             action_to_intents(
                 target=episodes[k].targets[tgt_idx[k]] if tgt_idx[k] < len(episodes[k].targets) else DO_NOTHING,
                 agent_client_id=episodes[k].agent_client_id,
                 troops=size_frac[k] * episodes[k].player_stats.get(episodes[k].agent_small_id, {}).get("troops", 0.0),
+                diplomacy=diplomacy_from_code(int(diplomacy_code[k]), episodes[k].targets),
             )
             for k in range(num_envs)
         ]
@@ -272,7 +258,7 @@ def collect_rollout(
 
             entity_features, prev_stats, curr_stats, done, won = apply_step(episode, step_result)
             episode.ticks += ACT_EVERY
-            episode.peak = max(episode.peak, float(episode.scalar[2]))
+            episode.peak = max(episode.peak, float(episode.scalar[1]))
             capped = False
             if not done and episode.ticks >= MAX_EPISODE_TICKS:
                 others = [v.get("tilesOwned", 0.0) for sid, v in episode.player_stats.items() if sid != episode.agent_small_id]
@@ -281,9 +267,14 @@ def collect_rollout(
                 capped_count += 1
             dones[i, k] = done
             wins[i, k] = won
-            rewards[i, k] = compute_reward(prev_stats, curr_stats, done, won, step_result["totalLand"], GAMMA_STEP)
+            conquests = step_result.get("conquests", [])
+            kills = sum(
+                c["conqueror"] == episode.agent_small_id and c["type"] == "NATION"
+                for c in conquests[episode.conquests_seen:]
+            )
+            episode.conquests_seen = len(conquests)
+            rewards[i, k] = compute_reward(prev_stats, curr_stats, done, won, step_result["totalLand"], GAMMA_STEP, kills)
 
-            _apply_gold_stats(episode.scalar, entity_features, gold_stats)
             episode.entities, episode.entity_mask = pad_entities(entity_features)
 
             if done:
@@ -293,7 +284,7 @@ def collect_rollout(
                 bucket = wins_by_setup.setdefault(f"{num_nations}{episode.difficulty[:1]}", [0, 0])
                 bucket[1] += 1
                 bucket[0] += int(won)
-                episodes[k] = start_episode(vec_bridge.bridges[k], gold_stats)
+                episodes[k] = start_episode(vec_bridge.bridges[k])
 
     if capped_count > CAP_FLAG_FRAC * max(int(dones.sum()), 1):
         print(f"[cap-flag] {capped_count}/{int(dones.sum())} episodes ended at the tick cap this update")
@@ -415,7 +406,7 @@ def ppo_update(
             batch_scalar = scalar_buf[batch_idx].to(DEVICE)
             batch_spatial = reconstruct_spatial_torch(
                 agent_id_buf[batch_idx].to(DEVICE).long(), owner_grid_buf[batch_idx].to(DEVICE).long(),
-                ratio_table_buf[batch_idx].to(DEVICE).float(), batch_scalar[:, 1], static_planes,
+                ratio_table_buf[batch_idx].to(DEVICE).float(), batch_scalar[:, 0], static_planes,
             )
             batch_entities = entities_buf[batch_idx].to(DEVICE)
             batch_entity_mask = entity_masks[batch_idx].to(DEVICE)
@@ -461,11 +452,13 @@ def ppo_update(
     num_minibatches = max(num_minibatches, 1)
 
     setups = " ".join(f"n{n}={w}/{t}" for n, (w, t) in sorted(rollout.wins_by_setup.items()))
+    diplomacy_code = decode_action(torch.from_numpy(rollout.actions))[2]
+    requests, breaks = int(((diplomacy_code >= 0) & (diplomacy_code < MAX_ENTITIES)).sum()), int((diplomacy_code >= MAX_ENTITIES).sum())
     print(
         f"update {update}: mean_reward={rewards.mean().item():.3f} "
         f"episodes_finished={rollout.episodes_finished} wins={rollout.episode_wins} "
         f"[{setups}] "
-        f"ends({_ends_str(rollout.end_records)}) "
+        f"ends({_ends_str(rollout.end_records)}) diplomacy(requests={requests} breaks={breaks}) "
         f"policy_loss={policy_loss_sum / num_minibatches:.4f} "
         f"value_loss={value_loss_sum / num_minibatches:.4f} "
         f"entropy={entropy_sum / num_minibatches:.4f} gate_kl={gate_kl_sum / num_minibatches:.4f} "
@@ -480,25 +473,21 @@ def train():
     total_train_hours = max(load_total_train_hours(), 0.0)
 
     with VecOpenFrontBridge(NUM_ENVS) as vec_bridge:
-        gold_stats = RunningMeanStd()
         return_stats = RunningMeanStd()
         checkpoint_path = latest_checkpoint()
         checkpoint = torch.load(checkpoint_path, map_location=DEVICE) if checkpoint_path is not None else None
         if checkpoint is not None:
-            gold_stats.mean, gold_stats.var, gold_stats.count = (
-                checkpoint["gold_mean"], checkpoint["gold_var"], checkpoint["gold_count"]
-            )
             return_stats.mean, return_stats.var, return_stats.count = (
                 checkpoint["return_mean"], checkpoint["return_var"], checkpoint["return_count"]
             )
             total_train_hours = max(total_train_hours, checkpoint.get("total_train_hours", 0.0))
 
-        episodes = start_all_episodes(vec_bridge, gold_stats)
+        episodes = start_all_episodes(vec_bridge)
         agent = Agent.from_observation(episodes[0].spatial, episodes[0].scalar, episodes[0].entities).to(DEVICE)
         optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
         warmup_from_update = None  # set when the optimizer starts without saved state
         if checkpoint is not None:
-            agent.load_state_dict(checkpoint["model"])
+            load_padded(agent, drop_gold_inputs(checkpoint["model"]) if "gold_mean" in checkpoint else checkpoint["model"])
             try:
                 optimizer.load_state_dict(checkpoint["optimizer"])
                 if any(s["exp_avg"].shape != p.shape for p, s in ((p, optimizer.state[p]) for p in agent.parameters()) if s):
@@ -511,10 +500,10 @@ def train():
         else:
             warmup_from_update = 0
 
-        print(f"training on device={DEVICE}, num_envs={NUM_ENVS}, nations={NATIONS}, difficulty={DIFFICULTIES}")
+        print(f"training on device={DEVICE}, num_envs={NUM_ENVS}, bots={BOTS}, nations={NATIONS}, difficulty={DIFFICULTIES}")
 
         for update in range(NUM_UPDATES):
-            episodes, rollout = collect_rollout(vec_bridge, agent, episodes, gold_stats)
+            episodes, rollout = collect_rollout(vec_bridge, agent, episodes)
 
             if warmup_from_update is not None:
                 since = update - warmup_from_update
@@ -532,9 +521,9 @@ def train():
             del rollout  # frees the buffers before the next rollout allocates its own
 
             if update != 0 and update % CHECKPOINT_INTERVAL == 0:
-                save_checkpoint(agent, update, gold_stats, return_stats, total_train_hours, optimizer)
+                save_checkpoint(agent, update, return_stats, total_train_hours, optimizer)
 
-        save_checkpoint(agent, NUM_UPDATES, gold_stats, return_stats, total_train_hours, optimizer)
+        save_checkpoint(agent, NUM_UPDATES, return_stats, total_train_hours, optimizer)
 
 
 if __name__ == "__main__":

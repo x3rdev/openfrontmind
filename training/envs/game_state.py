@@ -39,6 +39,7 @@ class EpisodeState:
     entity_mask: np.ndarray
     targets: list
     ticks: int = 0
+    conquests_seen: int = 0
     peak: float = 0.0
     difficulty: str = ""
     seed: str = ""

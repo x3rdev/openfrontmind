@@ -1,6 +1,9 @@
+import os
+
 WIN_REWARD = 150.0
 LOSS_REWARD = -150.0
 TILE_SCALE = 100.0
+ELIM_REWARD = float(os.environ.get("OFM_ELIM_REWARD", "5"))
 
 # Potential-based troop shaping: the potential is the share of peak troop production
 # forfeited, so spending troops costs the production it gives up.
@@ -19,9 +22,10 @@ def _prod_potential(stats: dict) -> float:
     return -PROD_COEF * (1.0 - _regen(stats.get("troops", 0.0), max_troops) / peak)
 
 
-def compute_reward(prev_stats: dict, curr_stats: dict, done: bool, won: bool, total_land: float, gamma: float) -> float:
+def compute_reward(prev_stats: dict, curr_stats: dict, done: bool, won: bool, total_land: float, gamma: float, eliminations: int = 0) -> float:
+    bonus = ELIM_REWARD * eliminations
     if done:
-        return WIN_REWARD if won else LOSS_REWARD
+        return (WIN_REWARD if won else LOSS_REWARD) + bonus
     tile_gain = (curr_stats.get("tilesOwned", 0.0) - prev_stats.get("tilesOwned", 0.0)) / max(total_land, 1)
     shaping = gamma * _prod_potential(curr_stats) - _prod_potential(prev_stats)
-    return TILE_SCALE * tile_gain + shaping
+    return TILE_SCALE * tile_gain + shaping + bonus
