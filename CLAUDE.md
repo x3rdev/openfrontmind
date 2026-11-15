@@ -205,8 +205,9 @@ Format: `update N` = training iteration count at that point. Stats, then verdict
   action is chosen, resetting this each time → jagged/square blobs, and risks
   compounding troop depletion (each new attack takes 20% of an already-reduced pool).
 - **Gold**: passive per-tick income scaling with territory/workers
-  (`goldAdditionRate`) — no kill bonus; an eliminated player's remaining gold is
-  destroyed, not transferred to the attacker.
+  (`goldAdditionRate`). Conquering a player transfers their gold to the conqueror
+  (`GameImpl.conquerPlayer`: all of a Nation/Bot's gold, half of a human's). An
+  attack that leaves the target under 100 tiles triggers the conquest.
 - Troops/gold are already in the network's observation (`observation.py` scalar);
   reward only uses tile fraction.
 

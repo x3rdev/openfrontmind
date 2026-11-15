@@ -95,9 +95,9 @@ def draw_troop_counts(
 def draw_units(img: np.ndarray, units: dict, width: int, scale: int = 1) -> np.ndarray:
     # Fixed black-on-white marker, not owner-colored - an owner-colored marker
     # can blend into same-colored territory underneath it and disappear.
-    radius = max(4, scale)
+    radius = int(max(4, scale))
     for u in units.values():
-        x, y = (u["pos"] % width) * scale, (u["pos"] // width) * scale
+        x, y = int((u["pos"] % width) * scale), int((u["pos"] // width) * scale)
         cv2.circle(img, (x, y), radius, (255, 255, 255), -1)
         cv2.circle(img, (x, y), radius, (0, 0, 0), 2)
         label = UNIT_LABELS.get(u["unitType"], "?")
