@@ -8,8 +8,9 @@ import time
 import numpy as np
 import torch.optim
 
+from training.envs.owned_env import EnvConfig, OwnedVecEnv
 from training.envs.vec_bridge import VecOpenFrontBridge
-from training.envs.game_state import EpisodeState, new_masks, apply_reset, apply_step
+from training.envs.game_state import EpisodeState, apply_step, episode_from_setup
 from training.envs.observation import encode_observation, reconstruct_spatial_torch, MAX_SMALL_ID
 from training.envs.action_space import build_entities, pad_entities, action_to_intents, diplomacy_from_code, DO_NOTHING, MAX_ENTITIES
 from training.envs.reward import compute_reward
@@ -21,6 +22,7 @@ from training.models.policy import Agent, decode_action, drop_gold_inputs, load_
 STEPS = int(os.environ.get("OFM_STEPS", "6500"))
 NUM_UPDATES = 10000
 NUM_ENVS = int(os.environ.get("OFM_NUM_ENVS", "10"))
+WORKER_ENV = os.environ.get("OFM_WORKER_ENV") == "1"  # workers own their episodes, see owned_env.py
 MAX_EPISODE_TICKS = 30000  # episodes still running here end; the highest tile share wins
 CAP_FLAG_FRAC = 0.05  # warn when more than this share of an update's episodes hit the cap
 
@@ -120,40 +122,6 @@ class Rollout:
     elapsed: float
 
 
-def _episode_state_from_setup(setup: dict) -> EpisodeState:
-    width, height = setup["width"], setup["height"]
-    owner_grid, land_mask, impassable_mask, is_mine, is_enemy = new_masks(width, height)
-    player_stats, agent_small_id, player_types = apply_reset(
-        owner_grid, land_mask, impassable_mask, is_mine, is_enemy, width, setup,
-    )
-
-    total_land = setup["totalLand"]
-    spatial, scalar, ratio_table = encode_observation(land_mask, impassable_mask, is_mine, is_enemy, player_stats, agent_small_id, total_land, owner_grid)
-    entity_features, targets = build_entities([], player_stats, player_types, total_land)
-    entities, entity_mask = pad_entities(entity_features)
-
-    return EpisodeState(
-        width=width,
-        height=height,
-        owner_grid=owner_grid,
-        land_mask=land_mask,
-        impassable_mask=impassable_mask,
-        is_mine=is_mine,
-        is_enemy=is_enemy,
-        ratio_table=ratio_table,
-        player_stats=player_stats,
-        agent_client_id=setup["agentClientID"],
-        agent_small_id=agent_small_id,
-        agent_name=setup["agentName"],
-        player_types=player_types,
-        spatial=spatial,
-        scalar=scalar,
-        entities=entities,
-        entity_mask=entity_mask,
-        targets=targets,
-    )
-
-
 def start_episode(bridge) -> EpisodeState:
     difficulty = random.choice(DIFFICULTIES)
     seed = str(random.randint(0, 2 ** 31 - 1))
@@ -164,7 +132,7 @@ def start_episode(bridge) -> EpisodeState:
         nations=NATIONS,
         difficulty=difficulty,
     )
-    episode = _episode_state_from_setup(setup)
+    episode = episode_from_setup(setup)
     episode.difficulty = difficulty
     episode.seed = seed
     return episode
@@ -317,6 +285,97 @@ def collect_rollout(
         elapsed=time.perf_counter() - rollout_start,
     )
     return episodes, rollout
+
+
+def collect_rollout_workers(env: OwnedVecEnv, agent) -> Rollout:
+    """collect_rollout for worker-owned episodes: observations come from shared memory."""
+    rollout_start = time.perf_counter()
+    num_envs = env.num_envs
+    obs = env.obs
+    height, width = obs["owner_grid"].shape[1:]
+    agent_id_buf = np.zeros((STEPS, num_envs), dtype=np.int16)
+    owner_grid_buf = np.zeros((STEPS, num_envs, height, width), dtype=np.int16)
+    ratio_table_buf = np.zeros((STEPS, num_envs, MAX_SMALL_ID), dtype=np.float16)
+    scalar_buf = np.zeros((STEPS, num_envs, *obs["scalar"].shape[1:]), dtype=np.float32)
+    entities_buf = np.zeros((STEPS, num_envs, *obs["entities"].shape[1:]), dtype=np.float32)
+    entity_masks = np.zeros((STEPS, num_envs, *obs["entity_mask"].shape[1:]), dtype=np.bool)
+    actions = np.zeros((STEPS, num_envs))
+    log_probs = np.zeros((STEPS, num_envs))
+    values = np.zeros((STEPS, num_envs))
+    rewards = np.zeros((STEPS, num_envs))
+    dones = np.zeros((STEPS, num_envs), dtype=np.bool)
+    wins = np.zeros((STEPS, num_envs), dtype=np.bool)
+    wins_by_setup: dict[str, list[int]] = {}
+    end_records: list[tuple] = []
+    capped_count = 0
+    ticks = np.zeros(num_envs, dtype=np.int64)
+
+    def to_device(name):
+        return torch.from_numpy(obs[name]).to(DEVICE)
+
+    for i in range(STEPS):
+        with torch.no_grad():
+            action, log_prob, entropy, value = agent.get_action_and_value(
+                spatial=to_device("spatial"), scalar=to_device("scalar"),
+                entities=to_device("entities"), entity_mask=to_device("entity_mask"),
+                action=None,
+            )
+        actions_np = action.cpu().numpy()
+        agent_id_buf[i] = obs["agent_id"]
+        owner_grid_buf[i] = obs["owner_grid"]
+        ratio_table_buf[i] = obs["ratio_table"]
+        scalar_buf[i] = obs["scalar"]
+        entities_buf[i] = obs["entities"]
+        entity_masks[i] = obs["entity_mask"]
+        actions[i] = actions_np
+        log_probs[i] = log_prob.cpu().numpy()
+        values[i] = value.squeeze(-1).cpu().numpy()
+
+        for k, info in enumerate(env.step(actions_np)):
+            rewards[i, k] = info["reward"]
+            dones[i, k] = info["done"]
+            wins[i, k] = info["won"]
+            ticks[k] = info["ticks"]
+            if info["done"]:
+                capped_count += info["capped"]
+                end_records.append((info["kind"], info["end_ticks"], info["peak"]))
+                bucket = wins_by_setup.setdefault(info["setup"], [0, 0])
+                bucket[1] += 1
+                bucket[0] += int(info["won"])
+
+    if capped_count > CAP_FLAG_FRAC * max(int(dones.sum()), 1):
+        print(f"[cap-flag] {capped_count}/{int(dones.sum())} episodes ended at the tick cap this update")
+    for k in range(num_envs):
+        if not dones[:, k].any():
+            print(f"[game-length] env {k} ran the full {STEPS}-tick rollout without finishing (ticks={ticks[k]})")
+
+    with torch.no_grad():
+        last_value = agent.get_value(
+            spatial=to_device("spatial"), scalar=to_device("scalar"),
+            entities=to_device("entities"), entity_mask=to_device("entity_mask"),
+        ).squeeze(-1).cpu()
+    return Rollout(
+        agent_ids=agent_id_buf,
+        static_planes=env.static_planes,
+        owner_grid=owner_grid_buf,
+        ratio_table=ratio_table_buf,
+        scalar=scalar_buf,
+        entities=entities_buf,
+        entity_mask=entity_masks,
+        actions=actions,
+        log_probs=log_probs,
+        values=values,
+        rewards=rewards,
+        dones=dones,
+        wins=wins,
+        last_value=last_value,
+        num_envs=num_envs,
+        episodes_finished=int(dones.sum().item()),
+        episode_wins=int(wins.sum().item()),
+        wins_by_setup=wins_by_setup,
+        end_records=end_records,
+        elapsed=time.perf_counter() - rollout_start,
+    )
 
 
 def _ends_str(records: list[tuple]) -> str:
@@ -472,7 +531,14 @@ def ppo_update(
 def train():
     total_train_hours = max(load_total_train_hours(), 0.0)
 
-    with VecOpenFrontBridge(NUM_ENVS) as vec_bridge:
+    if WORKER_ENV:
+        env_cm = OwnedVecEnv(NUM_ENVS, EnvConfig(
+            map="mid_plains", bots=BOTS, nations=NATIONS, difficulties=DIFFICULTIES,
+            max_episode_ticks=MAX_EPISODE_TICKS, act_every=ACT_EVERY, gamma_step=GAMMA_STEP,
+        ))
+    else:
+        env_cm = VecOpenFrontBridge(NUM_ENVS)
+    with env_cm as vec_bridge:
         return_stats = RunningMeanStd()
         checkpoint_path = latest_checkpoint()
         checkpoint = torch.load(checkpoint_path, map_location=DEVICE) if checkpoint_path is not None else None
@@ -482,8 +548,13 @@ def train():
             )
             total_train_hours = max(total_train_hours, checkpoint.get("total_train_hours", 0.0))
 
-        episodes = start_all_episodes(vec_bridge)
-        agent = Agent.from_observation(episodes[0].spatial, episodes[0].scalar, episodes[0].entities).to(DEVICE)
+        if WORKER_ENV:
+            vec_bridge.start()
+            first = vec_bridge.obs
+            agent = Agent.from_observation(first["spatial"][0], first["scalar"][0], first["entities"][0]).to(DEVICE)
+        else:
+            episodes = start_all_episodes(vec_bridge)
+            agent = Agent.from_observation(episodes[0].spatial, episodes[0].scalar, episodes[0].entities).to(DEVICE)
         optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
         warmup_from_update = None  # set when the optimizer starts without saved state
         if checkpoint is not None:
@@ -503,7 +574,10 @@ def train():
         print(f"training on device={DEVICE}, num_envs={NUM_ENVS}, bots={BOTS}, nations={NATIONS}, difficulty={DIFFICULTIES}")
 
         for update in range(NUM_UPDATES):
-            episodes, rollout = collect_rollout(vec_bridge, agent, episodes)
+            if WORKER_ENV:
+                rollout = collect_rollout_workers(vec_bridge, agent)
+            else:
+                episodes, rollout = collect_rollout(vec_bridge, agent, episodes)
 
             if warmup_from_update is not None:
                 since = update - warmup_from_update

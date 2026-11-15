@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from training.envs.observation import encode_observation
-from training.envs.action_space import build_entities
+from training.envs.action_space import build_entities, pad_entities
 
 PLAYER_ID_MASK = 0xFFF
 IS_LAND_BIT = 23  # terrainByte's IS_LAND_BIT (7) shifted by 16
@@ -207,3 +207,37 @@ def apply_step(episode: EpisodeState, step_result: dict) -> tuple[np.ndarray, di
     )
 
     return entity_features, prev_stats, curr_stats, done, won
+
+
+def episode_from_setup(setup: dict) -> EpisodeState:
+    width, height = setup["width"], setup["height"]
+    owner_grid, land_mask, impassable_mask, is_mine, is_enemy = new_masks(width, height)
+    player_stats, agent_small_id, player_types = apply_reset(
+        owner_grid, land_mask, impassable_mask, is_mine, is_enemy, width, setup,
+    )
+
+    total_land = setup["totalLand"]
+    spatial, scalar, ratio_table = encode_observation(land_mask, impassable_mask, is_mine, is_enemy, player_stats, agent_small_id, total_land, owner_grid)
+    entity_features, targets = build_entities([], player_stats, player_types, total_land)
+    entities, entity_mask = pad_entities(entity_features)
+
+    return EpisodeState(
+        width=width,
+        height=height,
+        owner_grid=owner_grid,
+        land_mask=land_mask,
+        impassable_mask=impassable_mask,
+        is_mine=is_mine,
+        is_enemy=is_enemy,
+        ratio_table=ratio_table,
+        player_stats=player_stats,
+        agent_client_id=setup["agentClientID"],
+        agent_small_id=agent_small_id,
+        agent_name=setup["agentName"],
+        player_types=player_types,
+        spatial=spatial,
+        scalar=scalar,
+        entities=entities,
+        entity_mask=entity_mask,
+        targets=targets,
+    )
