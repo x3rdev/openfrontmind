@@ -73,6 +73,8 @@ def main(
             cv2.waitKey(1)
 
         diplomacy_counts = {"request": 0, "break": 0}
+        broken_at: dict = {}
+        betrayal_attacks = 0
         do_nothing_ticks = 0
         attack_ticks = 0
         attack_troop_ratios = []
@@ -80,6 +82,7 @@ def main(
         first_attack_troop_ratio = None
         peak_tile_fraction = 0.0
         peak_tick = 0
+        tf_trace = []
 
         for i in range(int(1.0e100)):
             with torch.no_grad():
@@ -95,11 +98,17 @@ def main(
             diplomacy = diplomacy_from_code(diplomacy_code, targets)
             if diplomacy is not None:
                 diplomacy_counts[diplomacy[0]] += 1
+                if diplomacy[0] == "break":
+                    broken_at[diplomacy[1]] = i
             target = targets[action_idx] if action_idx < len(targets) else DO_NOTHING
+            if target in broken_at and i - broken_at[target] <= 5:
+                betrayal_attacks += 1
+                del broken_at[target]
 
             troop_ratio_now = float(scalar[0])
             tile_fraction_now = float(scalar[1])
 
+            tf_trace.append(tile_fraction_now)
             if diagnostic:
                 if target is DO_NOTHING:
                     do_nothing_ticks += 1
@@ -168,6 +177,11 @@ def main(
             encl_gained = sum(e["tiles"] for e in enclosures if e["capturing"] == episode.agent_small_id)
             encl_lost = sum(e["tiles"] for e in enclosures if e["victim"] == episode.agent_small_id)
             encl_events = sum(e["capturing"] == episode.agent_small_id for e in enclosures)
+            killed_by = [c for c in step_result.get("conquests", []) if c["conquered"] == episode.agent_small_id]
+            killer = killed_by[0]["conqueror"] if killed_by else None
+            killer_type = episode.player_types.get(killer, "none") if killer is not None else "none"
+            killer_allied = killer is not None and any({a["a"], a["b"]} == {killer, episode.agent_small_id} for a in alliances)
+            tf_at = ",".join(f"{tf_trace[k]:.2f}" if k < len(tf_trace) else "-" for k in (25, 50, 100, 200, 300))
             first_alliance = min((a["tick"] for a in alliances), default=None)
             print(
                 f"[diagnostic] seed={seed} winner={step_result['winner']} won={summary['won']} "
@@ -177,7 +191,7 @@ def main(
                 f"mean_attack_troop_ratio="
                 f"{mean_attack_troop_ratio if mean_attack_troop_ratio is None else f'{mean_attack_troop_ratio:.3f}'} "
                 f"peak_tile_fraction={peak_tile_fraction:.3f}@{peak_tick} "
-                f"requests_sent={diplomacy_counts['request']} breaks_sent={diplomacy_counts['break']} alliances_nation_nation={nation_alliances} alliances_with_agent={agent_alliances} first_alliance_tick={first_alliance} eliminations={eliminations} enclosure_events={encl_events} enclosure_tiles_gained={encl_gained} enclosure_tiles_lost={encl_lost} enclosures_all={len(enclosures)}"
+                f"requests_sent={diplomacy_counts['request']} breaks_sent={diplomacy_counts['break']} betrayal_attacks={betrayal_attacks} alliances_nation_nation={nation_alliances} alliances_with_agent={agent_alliances} first_alliance_tick={first_alliance} eliminations={eliminations} enclosure_events={encl_events} enclosure_tiles_gained={encl_gained} enclosure_tiles_lost={encl_lost} enclosures_all={len(enclosures)} killer={killer_type} killer_allied={killer_allied} tf_at_25_50_100_200_300={tf_at}"
             )
             return summary
 

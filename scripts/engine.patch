@@ -1,0 +1,65 @@
+diff --git a/src/core/Util.ts b/src/core/Util.ts
+index 1ce51bbe3..b82e6d82f 100644
+--- a/src/core/Util.ts
++++ b/src/core/Util.ts
+@@ -158,6 +158,16 @@ export function calculateBoundingBox(
+     }
+   }
+ 
++  // An empty borderTiles (e.g. an alive player transiently between tile
++  // ownership and their next border/cluster recalculation) would otherwise
++  // leak the Infinity/-Infinity sentinels straight into the returned box -
++  // downstream consumers computing max-min (e.g. NameBoxCalculator's
++  // createGrid) then try to allocate an Array(-Infinity) and crash with a
++  // RangeError. Degenerate input gets a degenerate (zero-size) box instead.
++  if (minX === Infinity) {
++    minX = maxX = minY = maxY = 0;
++  }
++
+   return { min: new Cell(minX, minY), max: new Cell(maxX, maxY) };
+ }
+ 
+diff --git a/src/core/execution/PlayerExecution.ts b/src/core/execution/PlayerExecution.ts
+index 4e2346aba..224497649 100644
+--- a/src/core/execution/PlayerExecution.ts
++++ b/src/core/execution/PlayerExecution.ts
+@@ -295,6 +295,15 @@ export class PlayerExecution implements Execution {
+       this.mg.conquerPlayer(capturing, this.player);
+     }
+ 
++    // OFM: log enclosure captures for training diagnostics.
++    (this.mg as unknown as { ofmEnclosures?: object[] }).ofmEnclosures?.push({
++      tick: this.mg.ticks(),
++      capturing: capturing.smallID(),
++      victim: this.player.smallID(),
++      victimType: this.player.type(),
++      tiles: tiles.length,
++    });
++
+     for (const tile of tiles) {
+       capturing.conquer(tile);
+     }
+diff --git a/src/core/game/GameImpl.ts b/src/core/game/GameImpl.ts
+index 279c4b435..2147bf0e2 100644
+--- a/src/core/game/GameImpl.ts
++++ b/src/core/game/GameImpl.ts
+@@ -128,8 +128,6 @@ export class GameImpl implements Game {
+     private _stats: Stats,
+     teamGameSpawnAreas?: TeamGameSpawnAreas,
+   ) {
+-    const constructorStart = performance.now();
+-
+     this._teamGameSpawnAreas = teamGameSpawnAreas;
+     this._terraNullius = new TerraNulliusImpl();
+     this._width = _map.width();
+@@ -146,10 +144,6 @@ export class GameImpl implements Game {
+       this.populateTeams();
+     }
+     this.addPlayers();
+-
+-    console.log(
+-      `[GameImpl] Constructor total: ${(performance.now() - constructorStart).toFixed(0)}ms`,
+-    );
+   }
+ 
+   private populateTeams() {
