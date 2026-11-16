@@ -5,11 +5,8 @@ entity feature array, padded to MAX_ENTITIES. The network scores rows by their f
 (policy.py), so row order carries no meaning. do-nothing is row 0.
 """
 
-import os
 
 import numpy as np
-
-ABLATE = set(os.environ.get("OFM_ABLATE", "").split(","))  # temporary test switch
 
 # [is_tribe, is_nation, is_wilderness, is_do_nothing, tile_fraction, troop_ratio,
 #  attacking_me_ratio, already_attacking, agent_ratio - troop_ratio,
@@ -43,8 +40,6 @@ def build_entities(
         already_attacking = float(c["alreadyAttacking"])
         committed = min(c.get("outgoingTroops", 0.0) / max(agent_troops, 1.0), 1.0)
         persist = [*memory.get(c["smallID"], (0.0, 1.0, 0.0)), committed]
-        if "persist" in ABLATE:
-            persist = [0.0] * 4
         if c["targetID"] is not None:
             stats = player_stats.get(c["smallID"], {})
             ptype = player_types.get(c["smallID"], "BOT")

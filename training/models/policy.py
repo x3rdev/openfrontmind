@@ -9,7 +9,6 @@ Distribution.set_default_validate_args(False)
 
 SIZE_BINS = (0.01, 0.02, 0.04, 0.08, 0.15, 0.3, 0.6)
 SIZE_INIT_PROBS = (0.25, 0.25, 0.2, 0.15, 0.1, 0.04, 0.01)
-ABLATE = set(os.environ.get("OFM_ABLATE", "").split(","))  # temporary test switch
 RESERVE_FLOOR = float(os.environ.get("OFM_RESERVE_FLOOR", "0.2"))
 CONV_OUT_CHANNELS = 32
 POOL_SIZE = 16
@@ -106,8 +105,6 @@ class Backbone(nn.Module):
     def forward(
         self, spatial: torch.Tensor, scalar: torch.Tensor, entities: torch.Tensor, entity_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if "spatial" in ABLATE:
-            spatial = torch.zeros_like(spatial)
         pooled_conv = self.pool(self.conv_stack(spatial)).flatten(start_dim=1)
         entity_context, entity_embeds = self.entity_encoder(entities, entity_mask)
         combined = torch.cat([pooled_conv, scalar, entity_context], dim=1)
