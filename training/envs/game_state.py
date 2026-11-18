@@ -6,6 +6,7 @@ Tile packing, from GameImpl.recordTileUpdate and GameMap:
   terrainByte bit 7 (bit 23 of packed) is land
 """
 
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -46,6 +47,7 @@ class EpisodeState:
     # per-target persistent memory, keyed by smallID (None = wilderness); see update_target_memory
     attack_ema: dict = field(default_factory=dict)
     last_attacking: dict = field(default_factory=dict)
+    tile_history: dict = field(default_factory=dict)
 
 
 TARGET_EMA_DECAY = 0.99
@@ -77,6 +79,27 @@ def update_target_memory(episode: EpisodeState, attack_mask: list, tick: int) ->
             float(focus is not no_focus and key == focus),
         )
     return memory
+
+
+MOMENTUM_WINDOWS = (5, 20)  # decisions
+
+
+def update_tile_momentum(episode: EpisodeState, attack_mask: list) -> dict:
+    """Relative tile growth of each player over MOMENTUM_WINDOWS decisions, clipped to [-1, 1].
+    Returns {smallID: (short, long)}."""
+    momentum = {}
+    for c in attack_mask:
+        key = c["smallID"]
+        if key is None:
+            continue
+        history = episode.tile_history.setdefault(key, deque(maxlen=max(MOMENTUM_WINDOWS) + 1))
+        now = episode.player_stats.get(key, {}).get("tilesOwned", 0.0)
+        history.append(now)
+        momentum[key] = tuple(
+            float(np.clip((now - history[max(-len(history), -(w + 1))]) / max(history[max(-len(history), -(w + 1))], 1.0), -1.0, 1.0))
+            for w in MOMENTUM_WINDOWS
+        )
+    return momentum
 
 
 def apply_tile_updates(
@@ -201,7 +224,7 @@ def apply_step(episode: EpisodeState, step_result: dict) -> tuple[np.ndarray, di
     memory = update_target_memory(episode, step_result["attackMask"], step_result["tick"])
     entity_features, episode.targets = build_entities(
         step_result["attackMask"], episode.player_stats, episode.player_types, total_land,
-        memory=memory,
+        memory=memory, momentum=update_tile_momentum(episode, step_result["attackMask"]),
         agent_ratio=curr_stats.get("troops", 0.0) / max(curr_stats.get("maxTroops", 1.0), 1),
         agent_troops=curr_stats.get("troops", 0.0), agent_tiles=curr_stats.get("tilesOwned", 0.0),
     )

@@ -13,8 +13,9 @@ import numpy as np
 #  log(their troops / my troops), log(their troops per tile / mine),
 #  4 persistent target-memory features,
 #  can_attack, can_request, allied, requested_me, is_traitor, traitor_ticks_left,
-#  log1p(betrayals), log1p(n_allies), allies' tile fraction]
-ENTITY_FEATURES = 24
+#  log1p(betrayals), log1p(n_allies), allies' tile fraction,
+#  tile growth over the last 5 and 20 decisions]
+ENTITY_FEATURES = 26
 MAX_ENTITIES = 32  # buffer size; lowest-priority rows are dropped when exceeded
 TRAITOR_TICKS = 300.0
 
@@ -24,15 +25,17 @@ DO_NOTHING = object()  # sentinel target, distinct from a real id or wilderness 
 def build_entities(
     attack_mask: list, player_stats: dict, player_types: dict, total_land: float,
     agent_ratio: float = 0.0, agent_troops: float = 0.0, agent_tiles: float = 0.0,
-    memory: dict | None = None,
+    memory: dict | None = None, momentum: dict | None = None,
 ) -> tuple[np.ndarray, list]:
     """Returns (features, targets): do-nothing first, then one row per candidate, and the
     matching target for action_to_intents.
 
     Candidates are sorted by smallID (wilderness first) so a target keeps its row. When
     there are more than MAX_ENTITIES - 1, the least relevant are dropped.
-    `memory` maps a target key (smallID or None) to its persistent features."""
+    `memory` maps a target key (smallID or None) to its persistent features,
+    `momentum` a smallID to its (short, long) tile growth."""
     memory = memory or {}
+    momentum = momentum or {}
     agent_density = agent_troops / max(agent_tiles, 1)
     candidates = []
     for c in attack_mask:
@@ -72,6 +75,7 @@ def build_entities(
                 float(np.log1p(c["betrayals"])),
                 float(np.log1p(len(c["allies"]))),
                 ally_tiles / max(total_land, 1),
+                *momentum.get(c["smallID"], (0.0, 0.0)),
             ]
             relevance = 4.0 * row[15] + 3.0 * (attacking_me_ratio > 0) + 2.0 * (row[17] + row[18]) + row[4]
         else:
