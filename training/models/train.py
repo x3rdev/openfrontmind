@@ -53,6 +53,7 @@ MINIBATCH_SIZE = 256
 CLIP_EPS = 0.2
 VALUE_COEF = 1.5
 GATE_KL_COEF = float(os.environ.get("OFM_GATE_KL", "0.08"))
+DIPLOMACY_KL_COEF = float(os.environ.get("OFM_DIPLOMACY_KL", GATE_KL_COEF))
 ENTROPY_COEF = float(os.environ.get("OFM_ENTROPY_COEF", "0"))
 
 
@@ -454,6 +455,7 @@ def ppo_update(
     value_loss_sum = 0.0
     entropy_sum = 0.0
     gate_kl_sum = 0.0
+    diplomacy_kl_sum = 0.0
     num_minibatches = 0
     approx_kl = 0.0
 
@@ -494,7 +496,9 @@ def ppo_update(
 
             entropy_mean = entropy.mean()
             gate_kl_mean = agent.gate_kl.mean()
-            loss = policy_loss + VALUE_COEF * value_loss + GATE_KL_COEF * gate_kl_mean - ENTROPY_COEF * entropy_mean
+            diplomacy_kl_mean = agent.diplomacy_kl.mean()
+            loss = (policy_loss + VALUE_COEF * value_loss + GATE_KL_COEF * gate_kl_mean
+                    + DIPLOMACY_KL_COEF * diplomacy_kl_mean - ENTROPY_COEF * entropy_mean)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
@@ -504,6 +508,7 @@ def ppo_update(
             value_loss_sum += value_loss.item()
             entropy_sum += entropy_mean.item()
             gate_kl_sum += gate_kl_mean.item()
+            diplomacy_kl_sum += diplomacy_kl_mean.item()
             num_minibatches += 1
 
     ppo_elapsed = time.perf_counter() - ppo_start
@@ -520,7 +525,7 @@ def ppo_update(
         f"ends({_ends_str(rollout.end_records)}) diplomacy(requests={requests} breaks={breaks}) "
         f"policy_loss={policy_loss_sum / num_minibatches:.4f} "
         f"value_loss={value_loss_sum / num_minibatches:.4f} "
-        f"entropy={entropy_sum / num_minibatches:.4f} gate_kl={gate_kl_sum / num_minibatches:.4f} "
+        f"entropy={entropy_sum / num_minibatches:.4f} gate_kl={gate_kl_sum / num_minibatches:.4f} dip_kl={diplomacy_kl_sum / num_minibatches:.4f} "
         f"approx_kl={approx_kl:.4f} "
         f"time={rollout_elapsed + ppo_elapsed:.1f}s (rollout={rollout_elapsed:.1f}s ppo={ppo_elapsed:.1f}s) "
         f"ticks/sec={total / rollout_elapsed:.1f} total_train_hours={total_train_hours:.2f}"

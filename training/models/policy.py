@@ -138,6 +138,9 @@ class Agent(nn.Module):
             self.size_head.bias.copy_(torch.log(torch.tensor(SIZE_INIT_PROBS)))
         self.reserve_floor = RESERVE_FLOOR
         self.gate_kl = None
+        self.diplomacy_kl = None
+        self.gate_override = None  # eval-only: troop ratio -> act probability, replaces the learned gate
+        self.force_wait = None  # eval-only: scalar -> bool mask of envs forced to wait
 
     @classmethod
     def from_observation(cls, spatial: np.ndarray, scalar: np.ndarray, entities: np.ndarray) -> "Agent":
@@ -165,6 +168,8 @@ class Agent(nn.Module):
         is_do_nothing = entities[..., 3] > 0.5
         real_target_mask = entity_mask & ~is_do_nothing & (entities[..., CAN_ATTACK] > 0.5)
         can_act = real_target_mask.any(dim=-1) & (troop_ratio >= self.reserve_floor)
+        if self.force_wait is not None:
+            can_act = can_act & ~self.force_wait(scalar)
         do_nothing_idx = is_do_nothing.float().argmax(dim=-1)
 
         query = self.query_proj(hidden)
@@ -173,6 +178,9 @@ class Agent(nn.Module):
         target_dist = Categorical(logits=target_scores)
 
         gate_logits = self.gate_head(torch.cat([hidden, scalar], dim=-1))
+        if self.gate_override is not None:
+            p = self.gate_override(troop_ratio).clamp(1e-6, 1 - 1e-6)
+            gate_logits = torch.log(torch.stack([1 - p, p], dim=-1))
         act_logit = torch.where(can_act, gate_logits[:, 1], torch.full_like(gate_logits[:, 1], -1e8))
         gate_dist = Categorical(logits=torch.stack([gate_logits[:, 0], act_logit], dim=-1))
 
@@ -198,7 +206,7 @@ class Agent(nn.Module):
         pending = (can_request & (entities[..., REQUESTED_ME] > 0.5)).any(dim=-1)
         prior = torch.where(pending, torch.full_like(troop_ratio, DIPLOMACY_PRIOR_PENDING), torch.full_like(troop_ratio, DIPLOMACY_PRIOR))
         diplomacy_ref = torch.log(torch.stack([1 - prior, prior], dim=-1))
-        self.gate_kl = self.gate_kl + (diplomacy_gate.probs * (diplomacy_gate.logits - diplomacy_ref)).sum(dim=-1)
+        self.diplomacy_kl = (diplomacy_gate.probs * (diplomacy_gate.logits - diplomacy_ref)).sum(dim=-1)
 
         action_was_sampled = action is None
         if action is None:
