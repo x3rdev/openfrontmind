@@ -17,7 +17,7 @@ from training.models.train import latest_checkpoint, BOTS, NATIONS, DIFFICULTY
 def main(
     checkpoint_path: str | Path, seed: str, scale: int, headless: bool = False, diagnostic: bool = False,
     bots: int = BOTS, nations: int = NATIONS, difficulty: str = DIFFICULTY,
-    max_ticks: int | None = None, map_name: str = "mid_plains", render_every: int = 10,
+    max_ticks: int | None = None, map_name: str = "mid_plains", render_every: int = 10, delay_ms: int = 1,
 ) -> dict | None:
     print(f"using checkpoint: {checkpoint_path}")
     torch.manual_seed(zlib.crc32(seed.encode()))  # actions are sampled from the torch RNG
@@ -47,6 +47,26 @@ def main(
             player_types=player_types,
             spatial=spatial, scalar=scalar, entities=entities, entity_mask=entity_mask, targets=targets,
         )
+
+        if diagnostic:
+            ys, xs = np.nonzero(owner_grid == agent_small_id)
+            me = np.array([xs.mean(), ys.mean()])
+            rivals = {}
+            for sid, t in player_types.items():
+                if sid != agent_small_id:
+                    ry, rx = np.nonzero(owner_grid == sid)
+                    if len(rx):
+                        rivals[sid] = (t, np.array([rx.mean(), ry.mean()]))
+            dist = lambda kind: sorted(float(np.linalg.norm(c - me)) for t, c in rivals.values() if kind is None or t == kind)
+            near_n, near_all = dist("NATION"), dist(None)
+            ly, lx = np.ogrid[:height, :width]
+            local = land_mask[(ly - me[1]) ** 2 + (lx - me[0]) ** 2 <= 30 ** 2].mean()
+            print(
+                f"[spawn] seed={seed} x={me[0]:.0f} y={me[1]:.0f} nearest_nation={near_n[0] if near_n else -1:.1f} "
+                f"nearest_any={near_all[0] if near_all else -1:.1f} nations_within_60={sum(d < 60 for d in near_n)} "
+                f"any_within_30={sum(d < 30 for d in near_all)} local_land={local:.2f} "
+                f"edge={min(me[0], me[1], width - me[0], height - me[1]):.0f} center={float(np.linalg.norm(me - [width / 2, height / 2])):.0f}"
+            )
 
         agent = Agent.from_observation(spatial, scalar, entities)
         load_padded(agent, drop_gold_inputs(checkpoint["model"]) if "gold_mean" in checkpoint else checkpoint["model"])
@@ -136,7 +156,7 @@ def main(
 
             if not headless and i % render_every == 0:
                 show()
-                if cv2.waitKey(1) & 0xFF == ord("q"):  # waitKey also repaints the window
+                if cv2.waitKey(delay_ms) & 0xFF == ord("q"):  # waitKey also repaints the window
                     break
 
             if done:
@@ -204,6 +224,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", default="seedseed", help="comma-separated for multiple runs")
     parser.add_argument("--scale", type=int, default=2)
     parser.add_argument("--render-every", type=int, default=10, help="redraw the map every N decisions")
+    parser.add_argument("--delay-ms", type=int, default=1, help="pause after each redraw, slows playback")
     parser.add_argument("--headless", action="store_true", help="skip the cv2 window")
     parser.add_argument("--diagnostic", action="store_true", help="print per-game action stats and, over several seeds, an aggregate")
     parser.add_argument("--bots", type=int, default=BOTS)
@@ -224,7 +245,7 @@ if __name__ == "__main__":
             checkpoint_path=checkpoint_path, seed=seed, scale=args.scale,
             headless=args.headless, diagnostic=args.diagnostic,
             bots=args.bots, nations=args.nations, difficulty=args.difficulty,
-            max_ticks=args.max_ticks, map_name=args.map_name, render_every=args.render_every,
+            max_ticks=args.max_ticks, map_name=args.map_name, render_every=args.render_every, delay_ms=args.delay_ms,
         ))
 
     if args.diagnostic and len(seeds) > 1:

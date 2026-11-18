@@ -54,6 +54,16 @@ class _EnvWorker:
         self.episode.difficulty = difficulty
         self.episode.seed = seed
         self.num_nations = sum(1 for t in self.episode.player_types.values() if t == "NATION")
+        self.episode.spawn = self._spawn_layout()
+
+    def _spawn_layout(self) -> dict:
+        ep = self.episode
+        out = {}
+        for sid, t in ep.player_types.items():
+            ys, xs = np.nonzero(ep.owner_grid == sid)
+            if len(xs):
+                out["agent" if sid == ep.agent_small_id else f"{t}{sid}"] = (float(xs.mean()), float(ys.mean()))
+        return out
 
     def observation(self) -> dict:
         ep = self.episode
@@ -107,6 +117,7 @@ class _EnvWorker:
 
         info = {"reward": reward, "done": done, "won": won, "ticks": ep.ticks}
         if done:
+            info["spawn"] = ep.spawn
             info.update(
                 kind="cap" if capped else "win" if won else "other" if step_result.get("winner") else "elim",
                 end_ticks=ep.ticks, peak=ep.peak, setup=f"{self.num_nations}{ep.difficulty[:1]}", capped=capped,

@@ -84,7 +84,6 @@ export interface HarnessSession {
   state: HarnessState;
   agentClientID: string;
   lastCityTick: number;
-  nukeIds: Set<number>;
 }
 
 const nameOf = (game: Game, id: number) => {
@@ -96,13 +95,6 @@ function logAlliances(game: Game, updates: GameUpdates, state: HarnessState): vo
   for (const u of updates[GameUpdateType.AllianceRequestReply]) {
     if (!u.accepted) continue;
     state.alliances.push({ tick: game.ticks(), a: u.request.requestorID, b: u.request.recipientID });
-    console.log(`[alliance] tick=${game.ticks()} formed ${nameOf(game, u.request.requestorID)} + ${nameOf(game, u.request.recipientID)}`);
-  }
-  for (const u of updates[GameUpdateType.BrokeAlliance]) {
-    console.log(`[alliance] tick=${game.ticks()} broken by ${nameOf(game, u.traitorID)} against ${nameOf(game, u.betrayedID)}`);
-  }
-  for (const u of updates[GameUpdateType.AllianceExpired]) {
-    console.log(`[alliance] tick=${game.ticks()} expired ${nameOf(game, u.player1ID)} + ${nameOf(game, u.player2ID)}`);
   }
 }
 
@@ -222,7 +214,7 @@ export async function reset(
   state.packedTileUpdates = combined;
   state.unitUpdates = spawnUnitUpdates;
 
-  return { runner, game, state, agentClientID, lastCityTick: -Infinity, nukeIds: new Set() };
+  return { runner, game, state, agentClientID, lastCityTick: -Infinity };
 }
 
 export interface AttackTarget {
@@ -374,12 +366,6 @@ export function step(
     if (state.packedPlayerUpdates) players.push(state.packedPlayerUpdates);
     if (state.unitUpdates) unitUpdates.push(...state.unitUpdates);
     if (game.getWinner() !== null) break;
-  }
-  for (const u of unitUpdates) {
-    if ((u.unitType === UnitType.AtomBomb || u.unitType === UnitType.HydrogenBomb) && !session.nukeIds.has(u.id)) {
-      session.nukeIds.add(u.id);
-      console.log(`[nuke] tick=${game.ticks()} type=${u.unitType} owner=${u.ownerID}`);
-    }
   }
   const concat = <T extends Uint32Array | Float64Array>(ctor: new (n: number) => T, parts: T[]): T => {
     const out = new ctor(parts.reduce((n, a) => n + a.length, 0));
